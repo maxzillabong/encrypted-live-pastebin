@@ -1,0 +1,14 @@
+{
+  "name": "livepaste",
+  "version": "1.0.0",
+  "description": "E2E encrypted real-time collaborative code sharing",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  }
+}
