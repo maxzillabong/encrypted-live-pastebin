@@ -327,7 +327,10 @@
     <div class="logo"><span>&#128274;</span><span>LivePaste</span></div>
     <div class="room-url" id="roomUrl" onclick="copyRoomUrl()"></div>
     <button class="btn" onclick="copyRoomUrl()">Share</button>
+    <button class="btn btn-secondary" id="passwordBtn" onclick="showSetPasswordModal()" title="Set room password">&#128272;</button>
+    <button class="btn btn-danger" onclick="confirmKillRoom()" title="Delete Room" style="background:#e94560;color:white;border:none">&#128163;</button>
     <div class="status">
+      <span id="passwordStatus" style="display:none">&#128274;</span>
       <span>&#128274; E2E</span>
       <div class="status-dot" id="statusDot"></div>
       <span id="statusText">Online</span>
@@ -357,6 +360,7 @@
       <div class="file-tree" id="fileTree"></div>
       <div class="sidebar-actions">
         <button class="btn btn-secondary" onclick="showAddFileModal()">+ Add File</button>
+        <button class="btn btn-secondary" onclick="showAddDirModal()">+ Add Directory</button>
         <button class="btn btn-secondary" onclick="uploadFolder()">&#128193; Upload Folder</button>
         <button class="btn btn-secondary" id="saveToDiskBtn" onclick="saveToDisk()" style="display:none">&#128190; Save to Disk</button>
         <input type="file" id="folderInput" webkitdirectory multiple style="display:none" onchange="handleFolderUpload(event)">
@@ -383,6 +387,43 @@
       <div class="modal-actions">
         <button class="btn btn-secondary" onclick="hideAddFileModal()">Cancel</button>
         <button class="btn" onclick="createNewFile()">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="addDirModal" class="modal-overlay hidden" onclick="if(event.target===this)hideAddDirModal()">
+    <div class="modal">
+      <h3>Add New Directory</h3>
+      <input type="text" id="newDirPath" placeholder="path/to/directory" onkeydown="if(event.key==='Enter')createNewDir()">
+      <p style="font-size:0.75rem;color:var(--muted);margin-top:0.5rem">Creates an empty .gitkeep file in the directory</p>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="hideAddDirModal()">Cancel</button>
+        <button class="btn" onclick="createNewDir()">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="passwordModal" class="modal-overlay hidden">
+    <div class="modal">
+      <h3 id="passwordModalTitle">Enter Room Password</h3>
+      <input type="password" id="passwordInput" placeholder="Password" onkeydown="if(event.key==='Enter')submitPassword()">
+      <p id="passwordError" style="color:var(--accent);font-size:0.875rem;margin-bottom:1rem;display:none"></p>
+      <div class="modal-actions">
+        <button class="btn" onclick="submitPassword()">Enter</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="setPasswordModal" class="modal-overlay hidden" onclick="if(event.target===this)hideSetPasswordModal()">
+    <div class="modal">
+      <h3>Set Room Password</h3>
+      <p style="font-size:0.875rem;color:var(--muted);margin-bottom:1rem">Protect this room with a password. Others will need it to access.</p>
+      <input type="password" id="setPasswordInput" placeholder="New password (min 4 chars)" onkeydown="if(event.key==='Enter')setRoomPassword()">
+      <input type="password" id="setPasswordConfirm" placeholder="Confirm password" style="margin-top:0.5rem" onkeydown="if(event.key==='Enter')setRoomPassword()">
+      <p id="setPasswordError" style="color:var(--accent);font-size:0.875rem;margin-top:0.5rem;display:none"></p>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="hideSetPasswordModal()">Cancel</button>
+        <button class="btn" onclick="setRoomPassword()">Set Password</button>
       </div>
     </div>
   </div>
@@ -418,7 +459,11 @@
     let dirHandle = null;
     let isPolling = false;
     let saveTimeout = null;
+    let lastActivityTime = 0;
+    const POLLING_PAUSE_MS = 2000; // Pause polling for 2s after typing
     let cmEditor = null; // CodeMirror instance
+    let roomPassword = sessionStorage.getItem('room_password_' + roomId) || '';
+    let hasPassword = false;
 
     async function initEncryption() {
       const fragment = window.location.hash.slice(1);
@@ -578,15 +623,48 @@
       return map[ext] || 'text/plain';
     }
 
+    // Hash password before sending (Client-side protection)
+    async function hashPassword(password) {
+      if (!password) return '';
+      const encoder = new TextEncoder();
+      const data = encoder.encode(password);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // API fetch with password header
+    async function apiFetch(url, options = {}) {
+      const headers = { ...options.headers };
+      if (roomPassword) {
+        headers['X-Room-Password'] = roomPassword;
+      }
+      const res = await fetch(url, { ...options, headers });
+      if (res.status === 401) {
+        const data = await res.json();
+        if (data.password_required) {
+          showPasswordModal();
+          throw new Error('Password required');
+        }
+      }
+      return res;
+    }
+
     async function fetchRoomState() {
-      const res = await fetch('/api/room/' + roomId);
+      const res = await apiFetch('/api/room/' + roomId);
       if (!res.ok) throw new Error('Failed to fetch room');
+      return res.json();
+    }
+
+    async function checkRoomInfo() {
+      const res = await fetch('/api/room/' + roomId + '/info');
+      if (!res.ok) throw new Error('Failed to get room info');
       return res.json();
     }
 
     async function saveFile(path, content, isSyncableFile) {
       if (isSyncableFile === undefined) isSyncableFile = true;
-      const res = await fetch('/api/room/' + roomId + '/files', {
+      const res = await apiFetch('/api/room/' + roomId + '/files', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -602,7 +680,7 @@
     }
 
     async function deleteFile(fileId) {
-      const res = await fetch('/api/room/' + roomId + '/files/' + fileId, { method: 'DELETE' });
+      const res = await apiFetch('/api/room/' + roomId + '/files/' + fileId, { method: 'DELETE' });
       if (!res.ok) throw new Error('Failed to delete file');
     }
 
@@ -622,7 +700,7 @@
         encrypted.push(...batchEncrypted);
         console.log(`Encrypted ${Math.min(i + BATCH_SIZE, fileList.length)}/${fileList.length} files`);
       }
-      const res = await fetch('/api/room/' + roomId + '/sync', {
+      const res = await apiFetch('/api/room/' + roomId + '/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ files: encrypted })
@@ -636,25 +714,40 @@
 
     async function poll() {
       if (isPolling) return;
+      
+      // Skip polling if user is actively typing to prevent overwrites/jank
+      if (Date.now() - lastActivityTime < POLLING_PAUSE_MS) return;
+
       isPolling = true;
       try {
-        const res = await fetch('/api/room/' + roomId + '/version');
+        const res = await apiFetch('/api/room/' + roomId + '/version');
         if (!res.ok) throw new Error('Version check failed');
         const { version: serverVersion } = await res.json();
 
         if (serverVersion > version) {
           // Version changed, fetch full state
-          const stateRes = await fetch('/api/room/' + roomId);
+          const stateRes = await apiFetch('/api/room/' + roomId);
           if (!stateRes.ok) throw new Error('State fetch failed');
           const state = await stateRes.json();
           await applyState(state);
         }
         setStatus(true);
       } catch (e) {
-        console.error('Poll error:', e);
-        setStatus(false);
+        if (e.message === 'Password required') {
+          stopPolling();
+        } else {
+          console.error('Poll error:', e);
+          setStatus(false);
+        }
       } finally {
         isPolling = false;
+      }
+    }
+
+    function stopPolling() {
+      if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
       }
     }
 
@@ -911,6 +1004,9 @@
 
     function handleEditorChange() {
       if (!selectedFile || !selectedFile.is_syncable || !cmEditor) return;
+      
+      lastActivityTime = Date.now();
+      
       clearTimeout(saveTimeout);
       saveTimeout = setTimeout(async () => {
         const content = cmEditor.getValue();
@@ -1098,7 +1194,7 @@
       const pending = changesets.find(cs => cs.status === 'pending');
       if (!pending) return;
       try {
-        await fetch(`/api/room/${roomId}/changesets/${pending.id}/accept`, { method: 'POST' });
+        await apiFetch(`/api/room/${roomId}/changesets/${pending.id}/accept`, { method: 'POST' });
         showToast('Changes accepted');
       } catch (e) {
         showToast('Failed to accept', 'error');
@@ -1109,7 +1205,7 @@
       const pending = changesets.find(cs => cs.status === 'pending');
       if (!pending) return;
       try {
-        await fetch(`/api/room/${roomId}/changesets/${pending.id}/reject`, { method: 'POST' });
+        await apiFetch(`/api/room/${roomId}/changesets/${pending.id}/reject`, { method: 'POST' });
         showToast('Changes rejected');
       } catch (e) {
         showToast('Failed to reject', 'error');
@@ -1118,7 +1214,7 @@
 
     async function acceptChange(changeId) {
       try {
-        await fetch(`/api/room/${roomId}/changes/${changeId}/accept`, { method: 'POST' });
+        await apiFetch(`/api/room/${roomId}/changes/${changeId}/accept`, { method: 'POST' });
         showToast('Change accepted');
       } catch (e) {
         showToast('Failed to accept', 'error');
@@ -1127,7 +1223,7 @@
 
     async function rejectChange(changeId) {
       try {
-        await fetch(`/api/room/${roomId}/changes/${changeId}/reject`, { method: 'POST' });
+        await apiFetch(`/api/room/${roomId}/changes/${changeId}/reject`, { method: 'POST' });
         showToast('Change rejected');
       } catch (e) {
         showToast('Failed to reject', 'error');
@@ -1166,12 +1262,193 @@
       });
     }
 
+    // Password modal functions
+    function showPasswordModal() {
+      document.getElementById('passwordModal').classList.remove('hidden');
+      document.getElementById('passwordInput').focus();
+      document.getElementById('passwordError').style.display = 'none';
+    }
+
+    function hidePasswordModal() {
+      document.getElementById('passwordModal').classList.add('hidden');
+      document.getElementById('passwordInput').value = '';
+    }
+
+    async function submitPassword() {
+      const passwordInput = document.getElementById('passwordInput').value;
+      if (!passwordInput) return;
+
+      try {
+        const passwordHash = await hashPassword(passwordInput);
+        const res = await fetch('/api/room/' + roomId + '/verify-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: passwordHash })
+        });
+
+        if (res.ok) {
+          roomPassword = passwordHash;
+          sessionStorage.setItem('room_password_' + roomId, roomPassword);
+          hidePasswordModal();
+          // Retry loading the room
+          const state = await fetchRoomState();
+          await applyState(state);
+          startPolling();
+          showToast('Access granted');
+        } else {
+          document.getElementById('passwordError').textContent = 'Incorrect password';
+          document.getElementById('passwordError').style.display = 'block';
+        }
+      } catch (e) {
+        document.getElementById('passwordError').textContent = 'Error verifying password';
+        document.getElementById('passwordError').style.display = 'block';
+      }
+    }
+
+    function showSetPasswordModal() {
+      document.getElementById('setPasswordModal').classList.remove('hidden');
+      document.getElementById('setPasswordInput').focus();
+      document.getElementById('setPasswordError').style.display = 'none';
+    }
+
+    function hideSetPasswordModal() {
+      document.getElementById('setPasswordModal').classList.add('hidden');
+      document.getElementById('setPasswordInput').value = '';
+      document.getElementById('setPasswordConfirm').value = '';
+    }
+
+    async function setRoomPassword() {
+      const password = document.getElementById('setPasswordInput').value;
+      const confirm = document.getElementById('setPasswordConfirm').value;
+      const errorEl = document.getElementById('setPasswordError');
+
+      if (password.length < 4) {
+        errorEl.textContent = 'Password must be at least 4 characters';
+        errorEl.style.display = 'block';
+        return;
+      }
+
+      if (password !== confirm) {
+        errorEl.textContent = 'Passwords do not match';
+        errorEl.style.display = 'block';
+        return;
+      }
+
+      try {
+        const passwordHash = await hashPassword(password);
+        const res = await fetch('/api/room/' + roomId + '/password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: passwordHash, current_password: roomPassword })
+        });
+
+        if (res.ok) {
+          roomPassword = passwordHash;
+          sessionStorage.setItem('room_password_' + roomId, roomPassword);
+          hasPassword = true;
+          updatePasswordUI();
+          hideSetPasswordModal();
+          showToast('Password set successfully');
+        } else {
+          const data = await res.json();
+          errorEl.textContent = data.error || 'Failed to set password';
+          errorEl.style.display = 'block';
+        }
+      } catch (e) {
+        errorEl.textContent = 'Error setting password';
+        errorEl.style.display = 'block';
+      }
+    }
+
+    async function confirmKillRoom() {
+      if (confirm('Are you sure you want to PERMANENTLY delete this room and all its files? This cannot be undone.')) {
+        try {
+          const res = await apiFetch('/api/room/' + roomId, { method: 'DELETE' });
+          if (res.ok) {
+            alert('Room deleted.');
+            window.location.href = '/';
+          } else {
+            showToast('Failed to delete room', 'error');
+          }
+        } catch (e) {
+          showToast('Error deleting room', 'error');
+        }
+      }
+    }
+
+    function updatePasswordUI() {
+      const statusEl = document.getElementById('passwordStatus');
+      const btnEl = document.getElementById('passwordBtn');
+      if (hasPassword) {
+        statusEl.style.display = 'inline';
+        statusEl.title = 'Room is password protected';
+        btnEl.title = 'Change room password';
+      } else {
+        statusEl.style.display = 'none';
+        btnEl.title = 'Set room password';
+      }
+    }
+
+    // Directory creation functions
+    function showAddDirModal() {
+      document.getElementById('addDirModal').classList.remove('hidden');
+      document.getElementById('newDirPath').focus();
+    }
+
+    function hideAddDirModal() {
+      document.getElementById('addDirModal').classList.add('hidden');
+      document.getElementById('newDirPath').value = '';
+    }
+
+    async function createNewDir() {
+      let path = document.getElementById('newDirPath').value.trim();
+      if (!path) return;
+      // Ensure path doesn't end with /
+      if (path.endsWith('/')) path = path.slice(0, -1);
+      // Create .gitkeep file in the directory
+      const gitkeepPath = path + '/.gitkeep';
+      try {
+        await saveFile(gitkeepPath, '');
+        hideAddDirModal();
+        showToast('Directory created');
+      } catch (e) {
+        showToast('Failed to create directory', 'error');
+      }
+    }
+
     async function init() {
       await initEncryption();
-      const state = await fetchRoomState();
-      await applyState(state);
-      initSidebarResize();
-      startPolling();
+
+      // Check if room has password
+      try {
+        const info = await checkRoomInfo();
+        hasPassword = info.has_password;
+        updatePasswordUI();
+
+        if (hasPassword && !roomPassword) {
+          // Need password - show modal
+          showPasswordModal();
+          return;
+        }
+      } catch (e) {
+        console.error('Failed to check room info:', e);
+      }
+
+      try {
+        const state = await fetchRoomState();
+        hasPassword = state.has_password || false;
+        updatePasswordUI();
+        await applyState(state);
+        initSidebarResize();
+        startPolling();
+      } catch (e) {
+        if (e.message === 'Password required') {
+          showPasswordModal();
+        } else {
+          console.error('Init error:', e);
+          showToast('Failed to load room', 'error');
+        }
+      }
     }
 
     init().catch(console.error);

@@ -13,6 +13,10 @@
  *   read <roomUrl>                     Full dump (use sparingly)
  *   write <roomUrl> <path> <content>   Write/update a file
  *   propose <roomUrl> ...              Propose changeset for review
+ *
+ * Password-protected rooms:
+ *   Use -p <password> or --password <password> before the room URL
+ *   Example: node livepaste-cli.mjs tree -p mypassword "http://..."
  */
 
 import { webcrypto, createHash } from 'crypto';
@@ -21,6 +25,11 @@ const crypto = webcrypto;
 // Hash a path for deterministic lookups
 function hashPath(path) {
   return createHash('sha256').update(path).digest('hex');
+}
+
+// Hash password for transmission (Client-side protection)
+function hashPassword(password) {
+  return createHash('sha256').update(password).digest('hex');
 }
 
 // Parse room URL to extract server, roomId, and encryption key
@@ -68,20 +77,32 @@ async function decrypt(base64, cryptoKey) {
 }
 
 // Fetch and decrypt room data (shared helper)
-async function fetchRoom(roomUrl) {
+async function fetchRoom(roomUrl, password = null) {
   const { server, roomId, encryptionKey } = parseRoomUrl(roomUrl);
   const cryptoKey = await importKey(encryptionKey);
 
-  const res = await fetch(`${server}/api/room/${roomId}`);
+  const headers = {};
+  if (password) {
+    headers['X-Room-Password'] = password;
+  }
+
+  const res = await fetch(`${server}/api/room/${roomId}`, { headers });
+  if (res.status === 401) {
+    const data = await res.json();
+    if (data.password_required) {
+      throw new Error('Room is password protected. Use -p <password> or --password <password>');
+    }
+    throw new Error(`Authentication failed: ${data.error || 'Unknown error'}`);
+  }
   if (!res.ok) throw new Error(`Failed to fetch room: ${res.status}`);
 
   const data = await res.json();
-  return { data, cryptoKey };
+  return { data, cryptoKey, server, roomId };
 }
 
 // Read all files from a room (full content)
-async function readRoom(roomUrl) {
-  const { data, cryptoKey } = await fetchRoom(roomUrl);
+async function readRoom(roomUrl, password = null) {
+  const { data, cryptoKey } = await fetchRoom(roomUrl, password);
 
   const files = await Promise.all(data.files.map(async f => ({
     id: f.id,
@@ -95,8 +116,8 @@ async function readRoom(roomUrl) {
 }
 
 // List file paths only (for orientation without bloating context)
-async function listTree(roomUrl) {
-  const { data, cryptoKey } = await fetchRoom(roomUrl);
+async function listTree(roomUrl, password = null) {
+  const { data, cryptoKey } = await fetchRoom(roomUrl, password);
 
   const paths = await Promise.all(data.files.map(async f => {
     const path = await decrypt(f.path_encrypted, cryptoKey);
@@ -109,8 +130,8 @@ async function listTree(roomUrl) {
 }
 
 // Read a specific file by path
-async function catFile(roomUrl, targetPath) {
-  const { data, cryptoKey } = await fetchRoom(roomUrl);
+async function catFile(roomUrl, targetPath, password = null) {
+  const { data, cryptoKey } = await fetchRoom(roomUrl, password);
 
   for (const f of data.files) {
     const path = await decrypt(f.path_encrypted, cryptoKey);
@@ -123,8 +144,8 @@ async function catFile(roomUrl, targetPath) {
 }
 
 // Read multiple files by path (batch cat)
-async function catFiles(roomUrl, targetPaths) {
-  const { data, cryptoKey } = await fetchRoom(roomUrl);
+async function catFiles(roomUrl, targetPaths, password = null) {
+  const { data, cryptoKey } = await fetchRoom(roomUrl, password);
   const pathSet = new Set(targetPaths);
   const results = [];
 
@@ -149,13 +170,18 @@ async function catFiles(roomUrl, targetPaths) {
 }
 
 // Write/update a file in a room
-async function writeFile(roomUrl, filePath, content) {
+async function writeFile(roomUrl, filePath, content, password = null) {
   const { server, roomId, encryptionKey } = parseRoomUrl(roomUrl);
   const cryptoKey = await importKey(encryptionKey);
 
+  const headers = { 'Content-Type': 'application/json' };
+  if (password) {
+    headers['X-Room-Password'] = password;
+  }
+
   const res = await fetch(`${server}/api/room/${roomId}/files`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({
       path_hash: hashPath(filePath),
       path_encrypted: await encrypt(filePath, cryptoKey),
@@ -164,14 +190,25 @@ async function writeFile(roomUrl, filePath, content) {
     })
   });
 
+  if (res.status === 401) {
+    const data = await res.json();
+    if (data.password_required) {
+      throw new Error('Room is password protected. Use -p <password> or --password <password>');
+    }
+  }
   if (!res.ok) throw new Error(`Failed to write file: ${res.status}`);
   return res.json();
 }
 
 // Propose a changeset
-async function proposeChangeset(roomUrl, author, message, changes) {
+async function proposeChangeset(roomUrl, author, message, changes, password = null) {
   const { server, roomId, encryptionKey } = parseRoomUrl(roomUrl);
   const cryptoKey = await importKey(encryptionKey);
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (password) {
+    headers['X-Room-Password'] = password;
+  }
 
   const encryptedChanges = await Promise.all(changes.map(async c => ({
     file_path_encrypted: await encrypt(c.filePath, cryptoKey),
@@ -182,7 +219,7 @@ async function proposeChangeset(roomUrl, author, message, changes) {
 
   const res = await fetch(`${server}/api/room/${roomId}/changesets`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({
       author_encrypted: await encrypt(author, cryptoKey),
       message_encrypted: await encrypt(message, cryptoKey),
@@ -190,12 +227,60 @@ async function proposeChangeset(roomUrl, author, message, changes) {
     })
   });
 
+  if (res.status === 401) {
+    const data = await res.json();
+    if (data.password_required) {
+      throw new Error('Room is password protected. Use -p <password> or --password <password>');
+    }
+  }
   if (!res.ok) throw new Error(`Failed to create changeset: ${res.status}`);
   return res.json();
 }
 
-// CLI interface
-const [,, command, ...args] = process.argv;
+// Kill/Delete a room
+async function killRoom(roomUrl, password = null) {
+  const { server, roomId } = parseRoomUrl(roomUrl);
+
+  const headers = {};
+  if (password) {
+    headers['X-Room-Password'] = password;
+  }
+
+  const res = await fetch(`${server}/api/room/${roomId}`, {
+    method: 'DELETE',
+    headers
+  });
+
+  if (res.status === 401) {
+    const data = await res.json();
+    if (data.password_required) {
+      throw new Error('Room is password protected. Use -p <password> or --password <password>');
+    }
+  }
+  if (!res.ok && res.status !== 404) throw new Error(`Failed to kill room: ${res.status}`);
+  return { success: true };
+}
+
+// CLI interface - parse password option first
+function parseArgs(rawArgs) {
+  let password = null;
+  const args = [];
+
+  for (let i = 0; i < rawArgs.length; i++) {
+    if (rawArgs[i] === '-p' || rawArgs[i] === '--password') {
+      password = rawArgs[++i];
+    } else {
+      args.push(rawArgs[i]);
+    }
+  }
+
+  return { password, args };
+}
+
+const [,, command, ...rawArgs] = process.argv;
+const { password: rawPassword, args } = parseArgs(rawArgs);
+// Hash the password immediately so we never send plaintext
+const password = rawPassword ? hashPassword(rawPassword) : null;
 
 async function main() {
   try {
@@ -203,10 +288,10 @@ async function main() {
       case 'tree': {
         const [roomUrl] = args;
         if (!roomUrl) {
-          console.error('Usage: node livepaste-cli.mjs tree <roomUrl>');
+          console.error('Usage: node livepaste-cli.mjs tree [-p password] <roomUrl>');
           process.exit(1);
         }
-        const paths = await listTree(roomUrl);
+        const paths = await listTree(roomUrl, password);
         // Output as simple tree for easy reading
         for (const f of paths) {
           const suffix = f.syncable ? '' : ` [binary, ${f.size || '?'} bytes]`;
@@ -218,14 +303,14 @@ async function main() {
       case 'cat': {
         const [roomUrl, ...filePaths] = args;
         if (!roomUrl || filePaths.length === 0) {
-          console.error('Usage: node livepaste-cli.mjs cat <roomUrl> <path1> [path2] [path3]...');
+          console.error('Usage: node livepaste-cli.mjs cat [-p password] <roomUrl> <path1> [path2]...');
           process.exit(1);
         }
         if (filePaths.length === 1) {
-          const result = await catFile(roomUrl, filePaths[0]);
+          const result = await catFile(roomUrl, filePaths[0], password);
           console.log(result.content);
         } else {
-          const results = await catFiles(roomUrl, filePaths);
+          const results = await catFiles(roomUrl, filePaths, password);
           for (const r of results) {
             console.log(`\n=== ${r.path} ===`);
             console.log(r.error || r.content);
@@ -237,10 +322,10 @@ async function main() {
       case 'read': {
         const [roomUrl] = args;
         if (!roomUrl) {
-          console.error('Usage: node livepaste-cli.mjs read <roomUrl>');
+          console.error('Usage: node livepaste-cli.mjs read [-p password] <roomUrl>');
           process.exit(1);
         }
-        const result = await readRoom(roomUrl);
+        const result = await readRoom(roomUrl, password);
         console.log(JSON.stringify(result, null, 2));
         break;
       }
@@ -249,10 +334,10 @@ async function main() {
         const [roomUrl, filePath, ...contentParts] = args;
         const content = contentParts.join(' ');
         if (!roomUrl || !filePath) {
-          console.error('Usage: node livepaste-cli.mjs write <roomUrl> <filePath> <content>');
+          console.error('Usage: node livepaste-cli.mjs write [-p password] <roomUrl> <filePath> <content>');
           process.exit(1);
         }
-        const result = await writeFile(roomUrl, filePath, content);
+        const result = await writeFile(roomUrl, filePath, content, password);
         console.log(JSON.stringify(result, null, 2));
         break;
       }
@@ -260,15 +345,26 @@ async function main() {
       case 'propose': {
         const [roomUrl, author, message, filePath, oldContent, newContent] = args;
         if (!roomUrl || !author || !message || !filePath) {
-          console.error('Usage: node livepaste-cli.mjs propose <roomUrl> <author> <message> <filePath> <oldContent> <newContent>');
+          console.error('Usage: node livepaste-cli.mjs propose [-p password] <roomUrl> <author> <message> <filePath> <oldContent> <newContent>');
           process.exit(1);
         }
         const result = await proposeChangeset(roomUrl, author, message, [{
           filePath,
           oldContent: oldContent || '',
           newContent: newContent || ''
-        }]);
+        }], password);
         console.log(JSON.stringify(result, null, 2));
+        break;
+      }
+
+      case 'kill': {
+        const [roomUrl] = args;
+        if (!roomUrl) {
+          console.error('Usage: node livepaste-cli.mjs kill [-p password] <roomUrl>');
+          process.exit(1);
+        }
+        await killRoom(roomUrl, password);
+        console.log(JSON.stringify({ success: true, message: 'Room deleted' }, null, 2));
         break;
       }
 
@@ -276,21 +372,29 @@ async function main() {
         console.log(`LivePaste CLI - Claude Code Integration
 
 Commands:
-  tree <roomUrl>                                    List all file paths (lightweight)
-  cat <roomUrl> <path> [path2...]                   Read specific file(s) by path
-  read <roomUrl>                                    Read ALL files (full dump, use sparingly)
-  write <roomUrl> <filePath> <content>              Write/update a file
-  propose <roomUrl> <author> <msg> <path> <old> <new>  Propose a changeset
+  tree [-p password] <roomUrl>                           List all file paths (lightweight)
+  cat [-p password] <roomUrl> <path> [path2...]          Read specific file(s) by path
+  read [-p password] <roomUrl>                           Read ALL files (full dump, use sparingly)
+  write [-p password] <roomUrl> <filePath> <content>     Write/update a file
+  propose [-p password] <roomUrl> <author> <msg> ...     Propose a changeset
+  kill [-p password] <roomUrl>                           Delete the room and all content
+
+Password Options:
+  -p, --password <password>   Password for password-protected rooms
 
 Workflow for Claude Code:
   1. Run 'tree' first to see what files exist
   2. Run 'cat' for specific files you need to read
   3. Use 'write' to update files or 'propose' for review
 
-Example:
+Examples:
+  # Public room
   node livepaste-cli.mjs tree "http://localhost:8080/room/abc123#keyhere"
-  node livepaste-cli.mjs cat "http://localhost:8080/room/abc123#keyhere" src/app.js
-  node livepaste-cli.mjs cat "http://localhost:8080/room/abc123#keyhere" src/app.js src/utils.js
+
+  # Password-protected room
+  node livepaste-cli.mjs tree -p secret123 "http://localhost:8080/room/abc123#keyhere"
+  node livepaste-cli.mjs cat -p secret123 "http://localhost:8080/room/abc123#keyhere" src/app.js
+  node livepaste-cli.mjs write -p secret123 "http://localhost:8080/room/abc123#keyhere" test.txt "Hello"
 `);
     }
   } catch (err) {

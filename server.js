@@ -5,8 +5,11 @@
 
 const express = require('express');
 const { Pool } = require('pg');
+const bcrypt = require('bcrypt');
 const fs = require('fs');
 const path = require('path');
+
+const BCRYPT_ROUNDS = 10;
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -38,6 +41,54 @@ async function ensureRoom(roomId) {
     'INSERT INTO rooms (id) VALUES ($1) ON CONFLICT (id) DO NOTHING',
     [roomId]
   );
+}
+
+// Get room info including password status
+async function getRoomInfo(roomId) {
+  const result = await pool.query(
+    'SELECT id, version, password_hash IS NOT NULL as has_password FROM rooms WHERE id = $1',
+    [roomId]
+  );
+  return result.rows[0] || null;
+}
+
+// Verify password for a room
+async function verifyRoomPassword(roomId, password) {
+  if (!password) return false;
+  const result = await pool.query(
+    'SELECT password_hash FROM rooms WHERE id = $1',
+    [roomId]
+  );
+  const room = result.rows[0];
+  if (!room || !room.password_hash) return true; // No password required
+  return bcrypt.compare(password, room.password_hash);
+}
+
+// Middleware to check room password
+function requireRoomPassword(req, res, next) {
+  const roomId = req.params.id;
+  const password = req.headers['x-room-password'] || req.query.password || '';
+
+  getRoomInfo(roomId).then(room => {
+    if (!room) {
+      return next(); // Room doesn't exist yet, let ensureRoom handle it
+    }
+    if (!room.has_password) {
+      return next(); // No password required
+    }
+    verifyRoomPassword(roomId, password).then(valid => {
+      if (valid) {
+        return next();
+      }
+      res.status(401).json({ error: 'Password required', password_required: true });
+    }).catch(err => {
+      console.error('[Auth] Password verification error:', err);
+      res.status(500).json({ error: 'Internal server error' });
+    });
+  }).catch(err => {
+    console.error('[Auth] Room info error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  });
 }
 
 // Get room state
@@ -75,26 +126,95 @@ app.get('/', (req, res) => {
   res.redirect('/room/' + generateRoomId());
 });
 
-// Serve room UI
+// Serve room UI (no password check - UI handles password prompt)
 app.get('/room/:id', async (req, res) => {
   await ensureRoom(req.params.id);
   res.type('html').send(htmlTemplate);
 });
 
-// Get room state
-app.get('/api/room/:id', async (req, res) => {
+// Check if room has password (public endpoint)
+app.get('/api/room/:id/info', async (req, res) => {
+  try {
+    await ensureRoom(req.params.id);
+    const info = await getRoomInfo(req.params.id);
+    res.json({
+      id: info.id,
+      has_password: info.has_password
+    });
+  } catch (err) {
+    console.error('[API] Get room info error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Set or update room password (only if no password exists, or correct current password provided)
+app.post('/api/room/:id/password', async (req, res) => {
+  const roomId = req.params.id;
+  const { password, current_password } = req.body;
+
+  if (!password || password.length < 4) {
+    return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  }
+
+  try {
+    await ensureRoom(roomId);
+    const room = await getRoomInfo(roomId);
+
+    // If room already has a password, verify current password
+    if (room.has_password) {
+      const valid = await verifyRoomPassword(roomId, current_password);
+      if (!valid) {
+        return res.status(401).json({ error: 'Current password incorrect' });
+      }
+    }
+
+    // Hash and store new password
+    const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    await pool.query(
+      'UPDATE rooms SET password_hash = $1, updated_at = NOW() WHERE id = $2',
+      [hash, roomId]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[API] Set password error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Verify password (for login)
+app.post('/api/room/:id/verify-password', async (req, res) => {
+  const roomId = req.params.id;
+  const { password } = req.body;
+
+  try {
+    const valid = await verifyRoomPassword(roomId, password);
+    if (valid) {
+      res.json({ success: true });
+    } else {
+      res.status(401).json({ error: 'Incorrect password' });
+    }
+  } catch (err) {
+    console.error('[API] Verify password error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get room state (password protected)
+app.get('/api/room/:id', requireRoomPassword, async (req, res) => {
   try {
     await ensureRoom(req.params.id);
     const state = await getRoomState(req.params.id);
-    res.json(state);
+    const info = await getRoomInfo(req.params.id);
+    res.json({ ...state, has_password: info.has_password });
   } catch (err) {
     console.error('[API] Get room error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Get room version only (for short polling)
-app.get('/api/room/:id/version', async (req, res) => {
+// Get room version only (for short polling, password protected)
+app.get('/api/room/:id/version', requireRoomPassword, async (req, res) => {
   try {
     const result = await pool.query('SELECT version FROM rooms WHERE id = $1', [req.params.id]);
     const version = result.rows[0]?.version || 0;
@@ -105,8 +225,8 @@ app.get('/api/room/:id/version', async (req, res) => {
   }
 });
 
-// Create/update file
-app.post('/api/room/:id/files', async (req, res) => {
+// Create/update file (password protected)
+app.post('/api/room/:id/files', requireRoomPassword, async (req, res) => {
   const roomId = req.params.id;
   const { path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes } = req.body;
 
@@ -130,8 +250,8 @@ app.post('/api/room/:id/files', async (req, res) => {
   }
 });
 
-// Delete file
-app.delete('/api/room/:id/files/:fileId', async (req, res) => {
+// Delete file (password protected)
+app.delete('/api/room/:id/files/:fileId', requireRoomPassword, async (req, res) => {
   const { id: roomId, fileId } = req.params;
 
   try {
@@ -154,8 +274,8 @@ app.delete('/api/room/:id/files/:fileId', async (req, res) => {
   }
 });
 
-// Bulk sync files
-app.post('/api/room/:id/sync', async (req, res) => {
+// Bulk sync files (password protected)
+app.post('/api/room/:id/sync', requireRoomPassword, async (req, res) => {
   const roomId = req.params.id;
   const { files } = req.body;
 
@@ -204,8 +324,8 @@ app.post('/api/room/:id/sync', async (req, res) => {
   }
 });
 
-// Create changeset
-app.post('/api/room/:id/changesets', async (req, res) => {
+// Create changeset (password protected)
+app.post('/api/room/:id/changesets', requireRoomPassword, async (req, res) => {
   const roomId = req.params.id;
   const { author_encrypted, message_encrypted, changes } = req.body;
 
@@ -249,8 +369,8 @@ app.post('/api/room/:id/changesets', async (req, res) => {
   }
 });
 
-// Accept entire changeset
-app.post('/api/room/:id/changesets/:changesetId/accept', async (req, res) => {
+// Accept entire changeset (password protected)
+app.post('/api/room/:id/changesets/:changesetId/accept', requireRoomPassword, async (req, res) => {
   const { id: roomId, changesetId } = req.params;
 
   try {
@@ -290,8 +410,8 @@ app.post('/api/room/:id/changesets/:changesetId/accept', async (req, res) => {
   }
 });
 
-// Reject entire changeset
-app.post('/api/room/:id/changesets/:changesetId/reject', async (req, res) => {
+// Reject entire changeset (password protected)
+app.post('/api/room/:id/changesets/:changesetId/reject', requireRoomPassword, async (req, res) => {
   const { changesetId } = req.params;
 
   try {
@@ -307,8 +427,8 @@ app.post('/api/room/:id/changesets/:changesetId/reject', async (req, res) => {
   }
 });
 
-// Accept single change
-app.post('/api/room/:id/changes/:changeId/accept', async (req, res) => {
+// Accept single change (password protected)
+app.post('/api/room/:id/changes/:changeId/accept', requireRoomPassword, async (req, res) => {
   const { id: roomId, changeId } = req.params;
 
   try {
@@ -344,8 +464,8 @@ app.post('/api/room/:id/changes/:changeId/accept', async (req, res) => {
   }
 });
 
-// Reject single change
-app.post('/api/room/:id/changes/:changeId/reject', async (req, res) => {
+// Reject single change (password protected)
+app.post('/api/room/:id/changes/:changeId/reject', requireRoomPassword, async (req, res) => {
   const { changeId } = req.params;
 
   try {
@@ -372,6 +492,20 @@ app.post('/api/room/:id/changes/:changeId/reject', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('[API] Reject change error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete room (kill switch)
+app.delete('/api/room/:id', requireRoomPassword, async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM rooms WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[API] Delete room error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -5,6 +5,7 @@
 CREATE TABLE rooms (
     id VARCHAR(32) PRIMARY KEY,
     version BIGINT NOT NULL DEFAULT 0,
+    password_hash TEXT,                     -- bcrypt hash of room password (NULL = no password)
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

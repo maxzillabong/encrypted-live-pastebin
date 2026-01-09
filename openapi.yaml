@@ -1,0 +1,770 @@
+openapi: 3.1.0
+info:
+  title: LivePaste API
+  description: |
+    E2E Encrypted Real-Time Collaborative Code Sharing API.
+
+    ## Authentication
+    Password-protected rooms require the `X-Room-Password` header on all protected endpoints.
+    The password sent in this header (and in password setup/verification endpoints) MUST be a SHA-256 hash
+    of the raw password (hex encoded) to prevent plaintext transmission.
+
+    ## Encryption
+    All file content and paths are encrypted client-side using AES-256-GCM before being sent to the server.
+    The encryption key is stored in the URL fragment (after #) and never sent to the server.
+  version: 1.0.0
+  contact:
+    name: LivePaste
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+paths:
+  /:
+    get:
+      summary: Redirect to new room
+      description: Creates a new room with a random ID and redirects to it
+      responses:
+        '302':
+          description: Redirect to new room
+          headers:
+            Location:
+              schema:
+                type: string
+                example: /room/AbCdEfGh
+
+  /room/{roomId}:
+    get:
+      summary: Get room UI
+      description: Serves the web UI HTML for the room
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+      responses:
+        '200':
+          description: HTML page
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api/room/{roomId}/info:
+    get:
+      summary: Get room info
+      description: Get basic room information including whether it's password-protected. This endpoint does not require password authentication.
+      tags:
+        - Room
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+      responses:
+        '200':
+          description: Room info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    description: Room ID
+                  has_password:
+                    type: boolean
+                    description: Whether the room is password-protected
+
+  /api/room/{roomId}/password:
+    post:
+      summary: Set room password
+      description: |
+        Set or update the room password.
+        - If the room has no password, anyone can set one.
+        - If the room already has a password, the current password must be provided to change it.
+      tags:
+        - Room
+        - Authentication
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - password
+              properties:
+                password:
+                  type: string
+                  minLength: 4
+                  description: SHA-256 hash of the new password (hex encoded)
+                current_password:
+                  type: string
+                  description: SHA-256 hash of the current password (hex encoded, required if room already has a password)
+      responses:
+        '200':
+          description: Password set successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '400':
+          description: Invalid password
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Current password incorrect
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/room/{roomId}/verify-password:
+    post:
+      summary: Verify room password
+      description: Verify if a password is correct for a room
+      tags:
+        - Authentication
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - password
+              properties:
+                password:
+                  type: string
+                  description: SHA-256 hash of the password to verify (hex encoded)
+      responses:
+        '200':
+          description: Password is correct
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401':
+          description: Incorrect password
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/room/{roomId}:
+    delete:
+      summary: Delete room
+      description: Permanently delete a room and all its contents
+      tags:
+        - Room
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+      responses:
+        '200':
+          description: Room deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401':
+          description: Password required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordRequiredError'
+        '404':
+          description: Room not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      summary: Get room state
+      description: Get the current state of the room including all files and pending changesets
+      tags:
+        - Room
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+      responses:
+        '200':
+          description: Room state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomState'
+        '401':
+          description: Password required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordRequiredError'
+
+  /api/room/{roomId}/version:
+    get:
+      summary: Get room version
+      description: Get only the current version number (for efficient polling)
+      tags:
+        - Room
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+      responses:
+        '200':
+          description: Room version
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: integer
+        '401':
+          description: Password required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordRequiredError'
+
+  /api/room/{roomId}/files:
+    post:
+      summary: Create or update file
+      description: Create a new file or update an existing one
+      tags:
+        - Files
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - path_hash
+                - path_encrypted
+              properties:
+                path_hash:
+                  type: string
+                  description: SHA-256 hash of the plaintext file path (for upsert)
+                path_encrypted:
+                  type: string
+                  description: Base64-encoded encrypted file path
+                content_encrypted:
+                  type: string
+                  nullable: true
+                  description: Base64-encoded encrypted file content (null for non-syncable files)
+                is_syncable:
+                  type: boolean
+                  default: true
+                  description: Whether this file's content should be synced
+                size_bytes:
+                  type: integer
+                  nullable: true
+                  description: File size in bytes (for non-syncable files)
+      responses:
+        '200':
+          description: File created/updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/File'
+        '401':
+          description: Password required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordRequiredError'
+
+  /api/room/{roomId}/files/{fileId}:
+    delete:
+      summary: Delete file
+      description: Delete a file from the room
+      tags:
+        - Files
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+        - name: fileId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: File UUID
+      responses:
+        '200':
+          description: File deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401':
+          description: Password required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordRequiredError'
+        '404':
+          description: File not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/room/{roomId}/sync:
+    post:
+      summary: Bulk sync files
+      description: Upload an entire folder state (replaces all existing files)
+      tags:
+        - Files
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - files
+              properties:
+                files:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - path_hash
+                      - path_encrypted
+                    properties:
+                      path_hash:
+                        type: string
+                        description: SHA-256 hash of the plaintext file path
+                      path_encrypted:
+                        type: string
+                        description: Base64-encoded encrypted file path
+                      content_encrypted:
+                        type: string
+                        nullable: true
+                        description: Base64-encoded encrypted file content
+                      is_syncable:
+                        type: boolean
+                        default: true
+                      size_bytes:
+                        type: integer
+                        nullable: true
+      responses:
+        '200':
+          description: Sync complete
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomState'
+        '401':
+          description: Password required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordRequiredError'
+
+  /api/room/{roomId}/changesets:
+    post:
+      summary: Create changeset
+      description: Propose a new changeset with multiple file changes (for AI agents or collaborators)
+      tags:
+        - Changesets
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - changes
+              properties:
+                author_encrypted:
+                  type: string
+                  description: Base64-encoded encrypted author name
+                message_encrypted:
+                  type: string
+                  description: Base64-encoded encrypted changeset message
+                changes:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - file_path_encrypted
+                      - new_content_encrypted
+                    properties:
+                      file_path_encrypted:
+                        type: string
+                        description: Base64-encoded encrypted file path
+                      old_content_encrypted:
+                        type: string
+                        description: Base64-encoded encrypted original content
+                      new_content_encrypted:
+                        type: string
+                        description: Base64-encoded encrypted new content
+                      diff_encrypted:
+                        type: string
+                        description: Base64-encoded encrypted unified diff
+      responses:
+        '200':
+          description: Changeset created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Changeset'
+        '401':
+          description: Password required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordRequiredError'
+
+  /api/room/{roomId}/changesets/{changesetId}/accept:
+    post:
+      summary: Accept changeset
+      description: Accept all changes in a changeset
+      tags:
+        - Changesets
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+        - name: changesetId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Changeset UUID
+      responses:
+        '200':
+          description: Changeset accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401':
+          description: Password required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordRequiredError'
+
+  /api/room/{roomId}/changesets/{changesetId}/reject:
+    post:
+      summary: Reject changeset
+      description: Reject all changes in a changeset
+      tags:
+        - Changesets
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+        - name: changesetId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Changeset UUID
+      responses:
+        '200':
+          description: Changeset rejected
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401':
+          description: Password required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordRequiredError'
+
+  /api/room/{roomId}/changes/{changeId}/accept:
+    post:
+      summary: Accept single change
+      description: Accept a single change within a changeset
+      tags:
+        - Changesets
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+        - name: changeId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Change UUID
+      responses:
+        '200':
+          description: Change accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401':
+          description: Password required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordRequiredError'
+        '404':
+          description: Change not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/room/{roomId}/changes/{changeId}/reject:
+    post:
+      summary: Reject single change
+      description: Reject a single change within a changeset
+      tags:
+        - Changesets
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+        - name: changeId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Change UUID
+      responses:
+        '200':
+          description: Change rejected
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401':
+          description: Password required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordRequiredError'
+        '404':
+          description: Change not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  parameters:
+    roomId:
+      name: roomId
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 32
+      description: Room identifier
+      example: AbCdEfGh
+
+    roomPasswordHeader:
+      name: X-Room-Password
+      in: header
+      required: false
+      schema:
+        type: string
+      description: SHA-256 hash of the room password (hex encoded, required for password-protected rooms)
+
+  securitySchemes:
+    roomPassword:
+      type: apiKey
+      in: header
+      name: X-Room-Password
+      description: Room password for password-protected rooms
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error message
+
+    PasswordRequiredError:
+      type: object
+      properties:
+        error:
+          type: string
+          example: Password required
+        password_required:
+          type: boolean
+          example: true
+
+    File:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: File UUID
+        path_hash:
+          type: string
+          description: SHA-256 hash of plaintext path
+        path_encrypted:
+          type: string
+          description: Base64-encoded encrypted file path
+        content_encrypted:
+          type: string
+          nullable: true
+          description: Base64-encoded encrypted content
+        is_syncable:
+          type: boolean
+          description: Whether content is synced
+        size_bytes:
+          type: integer
+          nullable: true
+          description: File size for non-syncable files
+        version:
+          type: integer
+          description: File version number
+        room_version:
+          type: integer
+          description: Room version after this change
+
+    Changeset:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Changeset UUID
+        author_encrypted:
+          type: string
+          description: Base64-encoded encrypted author name
+        message_encrypted:
+          type: string
+          description: Base64-encoded encrypted message
+        status:
+          type: string
+          enum: [pending, accepted, rejected, partial]
+          description: Changeset status
+        created_at:
+          type: string
+          format: date-time
+        resolved_at:
+          type: string
+          format: date-time
+          nullable: true
+        changes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Change'
+
+    Change:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Change UUID
+        file_path_encrypted:
+          type: string
+          description: Base64-encoded encrypted file path
+        old_content_encrypted:
+          type: string
+          nullable: true
+          description: Base64-encoded encrypted original content
+        new_content_encrypted:
+          type: string
+          description: Base64-encoded encrypted new content
+        diff_encrypted:
+          type: string
+          nullable: true
+          description: Base64-encoded encrypted unified diff
+        status:
+          type: string
+          enum: [pending, accepted, rejected]
+          description: Change status
+
+    RoomState:
+      type: object
+      properties:
+        version:
+          type: integer
+          description: Current room version
+        has_password:
+          type: boolean
+          description: Whether room is password-protected
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/File'
+        changesets:
+          type: array
+          items:
+            $ref: '#/components/schemas/Changeset'
+
+tags:
+  - name: Room
+    description: Room operations
+  - name: Authentication
+    description: Password authentication
+  - name: Files
+    description: File operations
+  - name: Changesets
+    description: Changeset operations (for AI agents and collaborators)
