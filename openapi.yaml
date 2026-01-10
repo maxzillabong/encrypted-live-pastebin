@@ -397,6 +397,317 @@ paths:
               schema:
                 $ref: '#/components/schemas/PasswordRequiredError'
 
+  /api/room/{roomId}/sync/begin:
+    post:
+      summary: Begin chunked sync
+      description: Start a chunked sync session for large folder uploads (Zscaler-friendly)
+      tags:
+        - Chunked Sync
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                client_id:
+                  type: string
+                  description: Unique client identifier
+                total_chunks:
+                  type: integer
+                  description: Expected number of chunks
+                total_files:
+                  type: integer
+                  description: Total number of files to sync
+                metadata:
+                  type: object
+                  description: Optional metadata (action, source, timestamp, etc.)
+      responses:
+        '200':
+          description: Sync session started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id:
+                    type: string
+                    description: Session ID for subsequent chunk uploads
+                  status:
+                    type: string
+                    example: ready
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  /api/room/{roomId}/sync/chunk:
+    post:
+      summary: Upload sync chunk
+      description: Upload a chunk of files (~150KB) with random delays between chunks
+      tags:
+        - Chunked Sync
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - session_id
+                - chunk_index
+                - files
+              properties:
+                session_id:
+                  type: string
+                chunk_index:
+                  type: integer
+                files:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      path_hash:
+                        type: string
+                      path_encrypted:
+                        type: string
+                      content_encrypted:
+                        type: string
+                      is_syncable:
+                        type: boolean
+                      size_bytes:
+                        type: integer
+                client_timestamp:
+                  type: string
+                  format: date-time
+                request_id:
+                  type: string
+                metadata:
+                  type: object
+      responses:
+        '200':
+          description: Chunk uploaded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  chunk_index:
+                    type: integer
+                  files_received:
+                    type: integer
+                  chunks_remaining:
+                    type: integer
+                  server_timestamp:
+                    type: string
+                    format: date-time
+
+  /api/room/{roomId}/sync/complete:
+    post:
+      summary: Complete chunked sync
+      description: Finalize sync session and delete files not included
+      tags:
+        - Chunked Sync
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - session_id
+              properties:
+                session_id:
+                  type: string
+                finalize:
+                  type: boolean
+                  default: true
+      responses:
+        '200':
+          description: Sync complete
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/RoomState'
+                  - type: object
+                    properties:
+                      sync_complete:
+                        type: boolean
+                      files_synced:
+                        type: integer
+                      server_timestamp:
+                        type: string
+                        format: date-time
+
+  /api/room/{roomId}/ops:
+    post:
+      summary: Submit operation
+      description: Submit a tiny encrypted delta (Google Docs-style real-time editing)
+      tags:
+        - Operations
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - file_path_hash
+                - op_encrypted
+              properties:
+                file_path_hash:
+                  type: string
+                  description: SHA-256 hash of the file path
+                op_encrypted:
+                  type: string
+                  description: "Encrypted operation: {pos, del, ins}"
+                client_id:
+                  type: string
+                  description: Client identifier for filtering own ops
+                base_version:
+                  type: integer
+                  description: File version this op is based on
+                metadata:
+                  type: object
+      responses:
+        '200':
+          description: Operation submitted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  seq:
+                    type: integer
+                    description: Assigned sequence number
+                  status:
+                    type: string
+                  server_timestamp:
+                    type: string
+                    format: date-time
+
+    get:
+      summary: Get operations
+      description: Get operations since a sequence number for real-time sync
+      tags:
+        - Operations
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+        - name: since
+          in: query
+          schema:
+            type: integer
+          description: Get ops with seq > this value
+        - name: file
+          in: query
+          schema:
+            type: string
+          description: Optional file_path_hash to filter ops
+      responses:
+        '200':
+          description: Operations list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ops:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        seq:
+                          type: integer
+                        file_path_hash:
+                          type: string
+                        op_encrypted:
+                          type: string
+                        client_id:
+                          type: string
+                        base_version:
+                          type: integer
+                        created_at:
+                          type: string
+                          format: date-time
+                  current_seq:
+                    type: integer
+                  has_more:
+                    type: boolean
+
+  /api/room/{roomId}/files/{pathHash}/snapshot:
+    post:
+      summary: Snapshot file
+      description: Compact operations into a new snapshot (periodic cleanup)
+      tags:
+        - Operations
+      security:
+        - roomPassword: []
+      parameters:
+        - $ref: '#/components/parameters/roomId'
+        - $ref: '#/components/parameters/roomPasswordHeader'
+        - name: pathHash
+          in: path
+          required: true
+          schema:
+            type: string
+          description: SHA-256 hash of the file path
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - content_encrypted
+                - through_seq
+              properties:
+                content_encrypted:
+                  type: string
+                  description: New encrypted content (result of applying all ops)
+                through_seq:
+                  type: integer
+                  description: Sequence number up to which ops are compacted
+      responses:
+        '200':
+          description: Snapshot created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  snapshot_seq:
+                    type: integer
+                  server_timestamp:
+                    type: string
+                    format: date-time
+
   /api/room/{roomId}/changesets:
     post:
       summary: Create changeset
@@ -747,6 +1058,9 @@ components:
         version:
           type: integer
           description: Current room version
+        op_seq:
+          type: integer
+          description: Current operation sequence number (for delta sync)
         has_password:
           type: boolean
           description: Whether room is password-protected
@@ -766,5 +1080,9 @@ tags:
     description: Password authentication
   - name: Files
     description: File operations
+  - name: Chunked Sync
+    description: Chunked upload for large folders (Zscaler-friendly, ~150KB per request)
+  - name: Operations
+    description: Real-time delta sync (Google Docs-style tiny operations)
   - name: Changesets
     description: Changeset operations (for AI agents and collaborators)

@@ -6,6 +6,7 @@
 const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -22,8 +23,28 @@ const pool = new Pool({ connectionString: DATABASE_URL });
 const RETENTION_HOURS = Math.max(1, Math.min(parseInt(process.env.RETENTION_HOURS, 10) || 24, 120));
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // Run cleanup every hour
 
-// Load HTML template
-const htmlTemplate = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8');
+// Load HTML template (serve from src/ in dev mode, public/ in production)
+const SERVE_SRC = process.env.SERVE_SRC === '1';
+const HTML_PATH = path.join(__dirname, SERVE_SRC ? 'src' : 'public', 'index.html');
+
+function loadHtmlTemplate() {
+  try {
+    return fs.readFileSync(HTML_PATH, 'utf8');
+  } catch (err) {
+    console.error(`Failed to load HTML from ${HTML_PATH}:`, err.message);
+    console.error('Run "npm run build" to generate public/index.html');
+    process.exit(1);
+  }
+}
+let htmlTemplate = loadHtmlTemplate();
+
+// Hot-reload in dev mode
+if (SERVE_SRC) {
+  fs.watchFile(HTML_PATH, () => {
+    console.log('Reloading HTML template...');
+    htmlTemplate = loadHtmlTemplate();
+  });
+}
 
 // Generate random room ID
 function generateRoomId() {
@@ -94,13 +115,14 @@ function requireRoomPassword(req, res, next) {
 // Get room state
 async function getRoomState(roomId) {
   const roomResult = await pool.query(
-    'SELECT version FROM rooms WHERE id = $1',
+    'SELECT version, op_seq FROM rooms WHERE id = $1',
     [roomId]
   );
   const version = roomResult.rows[0]?.version || 0;
+  const opSeq = roomResult.rows[0]?.op_seq || 0;
 
   const filesResult = await pool.query(
-    'SELECT id, path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes, version FROM files WHERE room_id = $1 ORDER BY path_encrypted',
+    'SELECT id, path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes, version, snapshot_seq FROM files WHERE room_id = $1 ORDER BY path_encrypted',
     [roomId]
   );
 
@@ -111,6 +133,7 @@ async function getRoomState(roomId) {
 
   return {
     version,
+    op_seq: opSeq,
     files: filesResult.rows,
     changesets: changesetsResult.rows.map(cs => ({
       ...cs,
@@ -274,7 +297,156 @@ app.delete('/api/room/:id/files/:fileId', requireRoomPassword, async (req, res) 
   }
 });
 
-// Bulk sync files (password protected)
+// Sync sessions for chunked uploads (in-memory, cleared on restart)
+const syncSessions = new Map();
+const SYNC_SESSION_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+
+// Clean up old sync sessions periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, session] of syncSessions) {
+    if (now - session.startedAt > SYNC_SESSION_TIMEOUT) {
+      syncSessions.delete(key);
+    }
+  }
+}, 60 * 1000);
+
+// Begin chunked sync session
+app.post('/api/room/:id/sync/begin', requireRoomPassword, async (req, res) => {
+  const roomId = req.params.id;
+  const { client_id, total_chunks, total_files, metadata } = req.body;
+
+  try {
+    await ensureRoom(roomId);
+
+    const sessionId = crypto.randomUUID();
+    syncSessions.set(`${roomId}:${sessionId}`, {
+      roomId,
+      clientId: client_id,
+      totalChunks: total_chunks,
+      totalFiles: total_files,
+      receivedChunks: 0,
+      pathHashes: new Set(),
+      startedAt: Date.now(),
+      metadata
+    });
+
+    res.json({
+      session_id: sessionId,
+      status: 'ready',
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('[API] Sync begin error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Upload a chunk of files
+app.post('/api/room/:id/sync/chunk', requireRoomPassword, async (req, res) => {
+  const roomId = req.params.id;
+  const { session_id, chunk_index, files, client_timestamp, request_id } = req.body;
+
+  const sessionKey = `${roomId}:${session_id}`;
+  const session = syncSessions.get(sessionKey);
+
+  if (!session) {
+    return res.status(400).json({ error: 'Invalid or expired sync session' });
+  }
+
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      for (const file of files) {
+        session.pathHashes.add(file.path_hash);
+        await client.query(
+          'INSERT INTO files (room_id, path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (room_id, path_hash) DO UPDATE SET path_encrypted = $3, content_encrypted = $4, is_syncable = $5, size_bytes = $6, version = files.version + 1, updated_at = NOW()',
+          [roomId, file.path_hash, file.path_encrypted, file.content_encrypted, file.is_syncable !== false, file.size_bytes || null]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    session.receivedChunks++;
+
+    res.json({
+      status: 'ok',
+      chunk_index,
+      files_received: files.length,
+      chunks_remaining: session.totalChunks - session.receivedChunks,
+      request_id,
+      server_timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('[API] Sync chunk error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Complete chunked sync - delete files not in sync
+app.post('/api/room/:id/sync/complete', requireRoomPassword, async (req, res) => {
+  const roomId = req.params.id;
+  const { session_id, client_checksum, finalize } = req.body;
+
+  const sessionKey = `${roomId}:${session_id}`;
+  const session = syncSessions.get(sessionKey);
+
+  if (!session) {
+    return res.status(400).json({ error: 'Invalid or expired sync session' });
+  }
+
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Delete files not in the sync session
+      const existingResult = await client.query(
+        'SELECT id, path_hash FROM files WHERE room_id = $1',
+        [roomId]
+      );
+
+      let deletedCount = 0;
+      for (const row of existingResult.rows) {
+        if (!session.pathHashes.has(row.path_hash)) {
+          await client.query('DELETE FROM files WHERE id = $1', [row.id]);
+          deletedCount++;
+        }
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    // Clean up session
+    syncSessions.delete(sessionKey);
+
+    const state = await getRoomState(roomId);
+    res.json({
+      ...state,
+      sync_complete: true,
+      files_synced: session.pathHashes.size,
+      server_timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('[API] Sync complete error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Legacy bulk sync (kept for backward compatibility)
 app.post('/api/room/:id/sync', requireRoomPassword, async (req, res) => {
   const roomId = req.params.id;
   const { files } = req.body;
@@ -492,6 +664,133 @@ app.post('/api/room/:id/changes/:changeId/reject', requireRoomPassword, async (r
     res.json({ success: true });
   } catch (err) {
     console.error('[API] Reject change error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// === Operations (tiny deltas for real-time editing) ===
+// These endpoints enable Google Docs-style traffic patterns
+
+// Submit an operation (tiny encrypted delta)
+app.post('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
+  const roomId = req.params.id;
+  const { file_path_hash, op_encrypted, client_id, base_version, metadata } = req.body;
+
+  try {
+    await ensureRoom(roomId);
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Get next sequence number atomically
+      const seqResult = await client.query(
+        'UPDATE rooms SET op_seq = op_seq + 1, version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING op_seq',
+        [roomId]
+      );
+      const seq = seqResult.rows[0].op_seq;
+
+      // Insert operation
+      await client.query(
+        'INSERT INTO operations (room_id, file_path_hash, seq, op_encrypted, client_id, base_version) VALUES ($1, $2, $3, $4, $5, $6)',
+        [roomId, file_path_hash, seq, op_encrypted, client_id, base_version || 0]
+      );
+
+      await client.query('COMMIT');
+
+      res.json({
+        seq,
+        status: 'ok',
+        server_timestamp: new Date().toISOString()
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('[API] Submit operation error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get operations since a sequence number
+app.get('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
+  const roomId = req.params.id;
+  const since = parseInt(req.query.since, 10) || 0;
+  const filePathHash = req.query.file; // Optional: filter by file
+
+  try {
+    let query = 'SELECT seq, file_path_hash, op_encrypted, client_id, base_version, created_at FROM operations WHERE room_id = $1 AND seq > $2';
+    const params = [roomId, since];
+
+    if (filePathHash) {
+      query += ' AND file_path_hash = $3';
+      params.push(filePathHash);
+    }
+
+    query += ' ORDER BY seq ASC LIMIT 1000'; // Cap at 1000 ops per request
+
+    const result = await pool.query(query, params);
+
+    // Get current sequence
+    const roomResult = await pool.query('SELECT op_seq FROM rooms WHERE id = $1', [roomId]);
+    const currentSeq = roomResult.rows[0]?.op_seq || 0;
+
+    res.json({
+      ops: result.rows,
+      current_seq: currentSeq,
+      has_more: result.rows.length === 1000
+    });
+  } catch (err) {
+    console.error('[API] Get operations error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Snapshot a file (compact operations into content)
+app.post('/api/room/:id/files/:pathHash/snapshot', requireRoomPassword, async (req, res) => {
+  const { id: roomId, pathHash } = req.params;
+  const { content_encrypted, through_seq } = req.body;
+
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Update file content and snapshot_seq
+      await client.query(
+        `UPDATE files SET
+          content_encrypted = $1,
+          snapshot_seq = $2,
+          version = version + 1,
+          updated_at = NOW()
+        WHERE room_id = $3 AND path_hash = $4`,
+        [content_encrypted, through_seq, roomId, pathHash]
+      );
+
+      // Delete old operations for this file that are now in the snapshot
+      await client.query(
+        'DELETE FROM operations WHERE room_id = $1 AND file_path_hash = $2 AND seq <= $3',
+        [roomId, pathHash, through_seq]
+      );
+
+      await client.query('COMMIT');
+
+      res.json({
+        status: 'ok',
+        snapshot_seq: through_seq,
+        server_timestamp: new Date().toISOString()
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('[API] Snapshot error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
