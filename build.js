@@ -51,7 +51,7 @@ async function build() {
     console.log(`  JS minified: ${(minified.code.length / 1024).toFixed(1)} KB (${((1 - minified.code.length / originalJS.length) * 100).toFixed(0)}% reduction)`);
 
     // Replace original JS with minified (use function to avoid $ substitution issues)
-    html = html.replace(/<script>[\s\S]*?<\/script>(\s*<\/body>)/, (match, closingBody) => {
+    html = html.replace(/<script>[\s\S]*?<\/script>(\s*<\/body>)/, (_, closingBody) => {
       return `<script>${minified.code}</script>${closingBody}`;
     });
   }
