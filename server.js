@@ -23,8 +23,28 @@ const pool = new Pool({ connectionString: DATABASE_URL });
 const RETENTION_HOURS = Math.max(1, Math.min(parseInt(process.env.RETENTION_HOURS, 10) || 24, 120));
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // Run cleanup every hour
 
-// Load HTML template
-const htmlTemplate = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8');
+// Load HTML template (serve from src/ in dev mode, public/ in production)
+const SERVE_SRC = process.env.SERVE_SRC === '1';
+const HTML_PATH = path.join(__dirname, SERVE_SRC ? 'src' : 'public', 'index.html');
+
+function loadHtmlTemplate() {
+  try {
+    return fs.readFileSync(HTML_PATH, 'utf8');
+  } catch (err) {
+    console.error(`Failed to load HTML from ${HTML_PATH}:`, err.message);
+    console.error('Run "npm run build" to generate public/index.html');
+    process.exit(1);
+  }
+}
+let htmlTemplate = loadHtmlTemplate();
+
+// Hot-reload in dev mode
+if (SERVE_SRC) {
+  fs.watchFile(HTML_PATH, () => {
+    console.log('Reloading HTML template...');
+    htmlTemplate = loadHtmlTemplate();
+  });
+}
 
 // Generate random room ID
 function generateRoomId() {

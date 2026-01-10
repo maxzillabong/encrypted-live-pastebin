@@ -343,13 +343,62 @@ const NEVER_SYNC_DIRS = new Set([
 - Parses `.gitignore` if present in uploaded folder
 - Applies gitignore patterns during upload filtering
 
+## Browser Isolation Detection
+
+LivePaste detects when it's running inside a browser isolation environment (Menlo, Zscaler Browser Isolation, etc.) and displays a warning badge.
+
+### Detection Methods
+
+1. **Clipboard API blocked** - Isolation often blocks clipboard access
+2. **Known user agents** - Menlo, Zscaler, Symantec-WS patterns
+3. **Injected scripts** - Isolation proxies inject monitoring scripts
+4. **Global variables** - `__isolation__`, `__menlo__`, `__zscaler__`
+5. **High input latency** - Pixel streaming typically adds 50-200ms
+
+### QR Code Sharing
+
+When copy/paste is blocked (common in isolation), users can share via QR code:
+- Click "QR" button in header
+- Scan with mobile device
+- Full URL including encryption key fragment
+
+## Build System
+
+The frontend is minified for production to remove comments and shorten variable names.
+
+### Build Commands
+
+```bash
+npm run build      # Build minified public/index.html from src/
+npm run start      # Build + start server (production)
+npm run dev        # Start server with public/ (no rebuild)
+npm run dev:src    # Start server with src/ + hot reload (development)
+```
+
+### Minification Results
+
+| Component | Source | Built | Reduction |
+|-----------|--------|-------|-----------|
+| JavaScript | 51 KB | 29 KB | 43% |
+| CSS | 8 KB | 6 KB | 30% |
+| Total HTML | 70 KB | 45 KB | 36% |
+
+### What Gets Minified
+
+- **JavaScript**: All comments stripped, variable names shortened (terser)
+- **CSS**: Comments removed, whitespace collapsed
+- **HTML**: Comments removed, whitespace between tags collapsed
+
 ## Project Structure
 
 ```
 livepaste/
 ├── server.js            # Express server (all backend logic)
+├── build.js             # Build script (minification)
+├── src/
+│   └── index.html       # Source frontend (readable, with comments)
 ├── public/
-│   └── index.html       # Complete frontend (single file)
+│   └── index.html       # Built frontend (minified, no comments)
 ├── init.sql             # Database schema
 ├── docker-compose.yml   # Postgres + App
 ├── Dockerfile           # Node app container
@@ -369,6 +418,9 @@ livepaste/
 
 <!-- Diff generation -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsdiff/5.1.0/diff.min.js"></script>
+
+<!-- QR code generation (for browser isolation fallback) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 ```
 
 ## Environment Variables

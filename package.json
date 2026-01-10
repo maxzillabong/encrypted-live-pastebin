@@ -4,12 +4,18 @@
   "description": "E2E encrypted real-time collaborative code sharing",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "build": "node build.js",
+    "start": "npm run build && node server.js",
+    "dev": "node --watch server.js",
+    "dev:src": "SERVE_SRC=1 node --watch server.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",
     "express": "^4.21.2",
     "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "html-minifier-terser": "^7.2.0",
+    "terser": "^5.44.1"
   }
 }
