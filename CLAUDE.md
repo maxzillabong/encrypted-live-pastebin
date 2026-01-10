@@ -442,17 +442,21 @@ npm run dev:src    # Start server with src/ + hot reload (development)
 
 ```
 livepaste/
-├── server.js            # Express server (all backend logic)
-├── build.js             # Build script (minification)
+├── server.js              # Express server (all backend logic)
+├── build.js               # Build script (minification)
 ├── src/
-│   └── index.html       # Source frontend (readable, with comments)
+│   └── index.html         # Source frontend (readable, with comments)
 ├── public/
-│   └── index.html       # Built frontend (minified, no comments)
-├── init.sql             # Database schema
-├── docker-compose.yml   # Postgres + App
-├── Dockerfile           # Node app container
+│   └── index.html         # Built frontend (minified, no comments)
+├── init.sql               # Database schema
+├── docker-compose.yml     # Postgres + App
+├── Dockerfile             # Multi-stage Node app container
+├── .github/
+│   └── workflows/
+│       └── deploy.yml     # CI/CD workflow for Hetzner deployment
 ├── package.json
-└── CLAUDE.md            # This file
+├── README.md              # User-facing documentation
+└── CLAUDE.md              # This file (technical documentation)
 ```
 
 ## External Dependencies (CDN)
@@ -498,6 +502,70 @@ psql postgres://livepaste:livepaste@localhost:5432/livepaste < init.sql
 npm install
 node server.js
 # Open http://localhost:8080
+```
+
+## Deployment
+
+### Docker Build
+
+The Dockerfile uses a multi-stage build:
+
+```dockerfile
+# Stage 1: Build (minify JS/CSS)
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY build.js ./
+COPY src ./src
+RUN npm run build
+
+# Stage 2: Runtime (production only)
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY server.js ./
+COPY --from=builder /app/public ./public
+EXPOSE 8080
+CMD ["node", "server.js"]
+```
+
+### GitHub Actions CI/CD
+
+The workflow in `.github/workflows/deploy.yml` automates deployment to Hetzner VPS:
+
+1. **On push to main:**
+   - Builds Docker image with multi-stage Dockerfile
+   - Pushes to GitHub Container Registry (ghcr.io)
+   - SSHs to Hetzner VPS
+   - Pulls and restarts the container
+
+2. **Required GitHub Secrets:**
+   - `HETZNER_HOST` - VPS IP or hostname
+   - `HETZNER_USER` - SSH username
+   - `HETZNER_SSH_KEY` - SSH private key (ed25519 or RSA)
+   - `DATABASE_URL` - Postgres connection string
+
+3. **On Hetzner VPS:**
+   ```bash
+   # Docker must be installed and configured to pull from ghcr.io
+   docker login ghcr.io -u USERNAME -p GITHUB_PAT
+   ```
+
+### Manual Deployment
+
+```bash
+# Build image
+docker build -t livepaste .
+
+# Run with environment variables
+docker run -d \
+  --name livepaste \
+  -p 8080:8080 \
+  -e DATABASE_URL=postgres://user:pass@host:5432/livepaste \
+  -e RETENTION_HOURS=24 \
+  livepaste
 ```
 
 ## Security Considerations
