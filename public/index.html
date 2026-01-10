@@ -327,6 +327,7 @@
     <div class="logo"><span>&#128274;</span><span>LivePaste</span></div>
     <div class="room-url" id="roomUrl" onclick="copyRoomUrl()"></div>
     <button class="btn" onclick="copyRoomUrl()">Share</button>
+    <button class="btn btn-secondary" onclick="showQRCode()" title="QR code (for browser isolation)">QR</button>
     <button class="btn btn-secondary" id="passwordBtn" onclick="showSetPasswordModal()" title="Set room password">&#128272;</button>
     <button class="btn btn-danger" onclick="confirmKillRoom()" title="Delete Room" style="background:#e94560;color:white;border:none">&#128163;</button>
     <div class="status">
@@ -428,6 +429,19 @@
     </div>
   </div>
 
+  <div id="qrModal" class="modal-overlay hidden" onclick="if(event.target===this)hideQRCode()">
+    <div class="modal" style="text-align:center;max-width:360px">
+      <h3>Scan to Share</h3>
+      <p style="font-size:0.875rem;color:var(--muted);margin-bottom:1rem">Use this if copy/paste is blocked (browser isolation)</p>
+      <div id="qrCode" style="background:white;padding:1rem;border-radius:8px;display:inline-block"></div>
+      <p style="font-size:0.75rem;color:var(--muted);margin-top:1rem;word-break:break-all" id="qrUrlDisplay"></p>
+      <div class="modal-actions" style="margin-top:1rem">
+        <button class="btn btn-secondary" onclick="hideQRCode()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/matchbrackets.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/closebrackets.min.js"></script>
@@ -1375,6 +1389,27 @@
     function copyRoomUrl() {
       navigator.clipboard.writeText(window.location.href);
       showToast('URL copied to clipboard');
+    }
+
+    let qrCodeInstance = null;
+    function showQRCode() {
+      const url = window.location.href;
+      const container = document.getElementById('qrCode');
+      container.innerHTML = '';
+      qrCodeInstance = new QRCode(container, {
+        text: url,
+        width: 200,
+        height: 200,
+        colorDark: '#000000',
+        colorLight: '#ffffff',
+        correctLevel: QRCode.CorrectLevel.M
+      });
+      document.getElementById('qrUrlDisplay').textContent = url;
+      document.getElementById('qrModal').classList.remove('hidden');
+    }
+
+    function hideQRCode() {
+      document.getElementById('qrModal').classList.add('hidden');
     }
 
     async function downloadAll() {
