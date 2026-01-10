@@ -1,0 +1,48 @@
+name: Build and Deploy (Watchtower)
+
+# Alternative: Uses Watchtower on VPS to auto-pull new images
+# No SSH needed - just push to registry, Watchtower handles the rest
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: registry.your-hetzner.com  # Replace with your registry URL
+  IMAGE_NAME: livepaste
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Hetzner Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Optional: Trigger Watchtower immediately via HTTP API
+      - name: Trigger Watchtower update
+        if: ${{ secrets.WATCHTOWER_TOKEN != '' }}
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.WATCHTOWER_TOKEN }}" \
+            "http://${{ secrets.HETZNER_HOST }}:8081/v1/update" || true
