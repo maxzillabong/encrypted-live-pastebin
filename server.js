@@ -144,6 +144,290 @@ async function getRoomState(roomId) {
 
 // === API Routes ===
 
+// === Disguised Routes (masquerade as document management app) ===
+// These aliases make traffic look like a typical SaaS collaboration tool
+
+// Workspace = Room
+app.get('/api/workspace/:id', requireRoomPassword, async (req, res) => {
+  try {
+    await ensureRoom(req.params.id);
+    const state = await getRoomState(req.params.id);
+    const info = await getRoomInfo(req.params.id);
+    // Wrap in document-like response
+    res.json({
+      workspace_id: req.params.id,
+      documents: state.files.map(f => ({
+        id: f.id,
+        title: f.path_encrypted,
+        content: f.content_encrypted,
+        metadata: {
+          refs: [f.path_hash],
+          tracking: { utm_source: f.version?.toString() || '1' }
+        },
+        is_syncable: f.is_syncable,
+        size_bytes: f.size_bytes,
+        updated_at: f.updated_at
+      })),
+      version: state.version,
+      op_seq: state.op_seq,
+      has_password: info.has_password,
+      proposals: state.changesets
+    });
+  } catch (err) {
+    console.error('[API] Get workspace error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/workspace/:id/info', async (req, res) => {
+  try {
+    await ensureRoom(req.params.id);
+    const info = await getRoomInfo(req.params.id);
+    res.json({
+      workspace_id: info.id,
+      requires_auth: info.has_password,
+      type: 'collaborative'
+    });
+  } catch (err) {
+    console.error('[API] Get workspace info error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/workspace/:id/status', requireRoomPassword, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT version FROM rooms WHERE id = $1', [req.params.id]);
+    res.json({
+      workspace_id: req.params.id,
+      revision: result.rows[0]?.version || 0,
+      sync_status: 'current'
+    });
+  } catch (err) {
+    console.error('[API] Get workspace status error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Document save = File create/update
+app.post('/api/documents/save', requireRoomPassword, async (req, res) => {
+  const { workspace_id, title, content, metadata } = req.body;
+  const roomId = workspace_id || req.query.workspace;
+
+  // Extract real data from disguised payload
+  const path_hash = metadata?.refs?.[0] || await hashString(title);
+  const path_encrypted = title;
+  const content_encrypted = content;
+
+  try {
+    await ensureRoom(roomId);
+    const result = await pool.query(
+      'INSERT INTO files (room_id, path_hash, path_encrypted, content_encrypted, is_syncable) VALUES ($1, $2, $3, $4, true) ON CONFLICT (room_id, path_hash) DO UPDATE SET path_encrypted = $3, content_encrypted = $4, version = files.version + 1, updated_at = NOW() RETURNING id, path_hash, version',
+      [roomId, path_hash, path_encrypted, content_encrypted]
+    );
+
+    res.json({
+      id: `doc_${result.rows[0].id.slice(0, 8)}`,
+      title: path_encrypted,
+      revision: result.rows[0].version,
+      status: 'saved',
+      updated_at: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('[API] Document save error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Document edits = Operations (tiny deltas)
+app.post('/api/documents/:docId/edits', requireRoomPassword, async (req, res) => {
+  const { workspace_id, edit_data, author_id, base_revision } = req.body;
+  const roomId = workspace_id || req.query.workspace;
+  const file_path_hash = req.params.docId;
+
+  try {
+    await ensureRoom(roomId);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const seqResult = await client.query(
+        'UPDATE rooms SET op_seq = op_seq + 1, version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING op_seq',
+        [roomId]
+      );
+      const seq = seqResult.rows[0].op_seq;
+
+      await client.query(
+        'INSERT INTO operations (room_id, file_path_hash, seq, op_encrypted, client_id, base_version) VALUES ($1, $2, $3, $4, $5, $6)',
+        [roomId, file_path_hash, seq, edit_data, author_id, base_revision || 0]
+      );
+      await client.query('COMMIT');
+
+      res.json({
+        edit_id: `edit_${seq}`,
+        revision: seq,
+        status: 'applied',
+        timestamp: new Date().toISOString()
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('[API] Document edit error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/documents/:docId/edits', requireRoomPassword, async (req, res) => {
+  const roomId = req.query.workspace;
+  const since = parseInt(req.query.since, 10) || 0;
+  const filePathHash = req.params.docId;
+
+  try {
+    const result = await pool.query(
+      'SELECT seq, op_encrypted, client_id, created_at FROM operations WHERE room_id = $1 AND file_path_hash = $2 AND seq > $3 ORDER BY seq ASC LIMIT 1000',
+      [roomId, filePathHash, since]
+    );
+    const roomResult = await pool.query('SELECT op_seq FROM rooms WHERE id = $1', [roomId]);
+
+    res.json({
+      edits: result.rows.map(r => ({
+        edit_id: `edit_${r.seq}`,
+        data: r.op_encrypted,
+        author_id: r.client_id,
+        timestamp: r.created_at
+      })),
+      current_revision: roomResult.rows[0]?.op_seq || 0,
+      has_more: result.rows.length === 1000
+    });
+  } catch (err) {
+    console.error('[API] Get document edits error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Batch document sync = Chunked sync
+app.post('/api/workspace/:id/session', requireRoomPassword, async (req, res) => {
+  const roomId = req.params.id;
+  const { client_id, batch_count, document_count } = req.body;
+
+  try {
+    await ensureRoom(roomId);
+    const sessionId = crypto.randomUUID();
+    syncSessions.set(`${roomId}:${sessionId}`, {
+      roomId,
+      clientId: client_id,
+      totalChunks: batch_count,
+      totalFiles: document_count,
+      receivedChunks: 0,
+      pathHashes: new Set(),
+      startedAt: Date.now()
+    });
+
+    res.json({
+      session_token: sessionId,
+      status: 'ready',
+      expires_at: new Date(Date.now() + SYNC_SESSION_TIMEOUT).toISOString()
+    });
+  } catch (err) {
+    console.error('[API] Workspace session error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/documents/batch', requireRoomPassword, async (req, res) => {
+  const { workspace_id, session_token, batch_index, documents } = req.body;
+  const roomId = workspace_id;
+  const sessionKey = `${roomId}:${session_token}`;
+  const session = syncSessions.get(sessionKey);
+
+  if (!session) {
+    return res.status(400).json({ error: 'Session expired' });
+  }
+
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const doc of documents) {
+        const pathHash = doc.metadata?.refs?.[0] || doc.id;
+        session.pathHashes.add(pathHash);
+        await client.query(
+          'INSERT INTO files (room_id, path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (room_id, path_hash) DO UPDATE SET path_encrypted = $3, content_encrypted = $4, is_syncable = $5, size_bytes = $6, version = files.version + 1, updated_at = NOW()',
+          [roomId, pathHash, doc.title, doc.content, doc.is_syncable !== false, doc.size_bytes || null]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    session.receivedChunks++;
+    res.json({
+      status: 'ok',
+      batch_index,
+      documents_saved: documents.length,
+      batches_remaining: session.totalChunks - session.receivedChunks
+    });
+  } catch (err) {
+    console.error('[API] Batch save error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/workspace/:id/finalize', requireRoomPassword, async (req, res) => {
+  const roomId = req.params.id;
+  const { session_token } = req.body;
+  const sessionKey = `${roomId}:${session_token}`;
+  const session = syncSessions.get(sessionKey);
+
+  if (!session) {
+    return res.status(400).json({ error: 'Session expired' });
+  }
+
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const existingResult = await client.query('SELECT id, path_hash FROM files WHERE room_id = $1', [roomId]);
+      for (const row of existingResult.rows) {
+        if (!session.pathHashes.has(row.path_hash)) {
+          await client.query('DELETE FROM files WHERE id = $1', [row.id]);
+        }
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    syncSessions.delete(sessionKey);
+    const state = await getRoomState(roomId);
+    res.json({
+      status: 'complete',
+      documents_synced: session.pathHashes.size,
+      workspace_revision: state.version
+    });
+  } catch (err) {
+    console.error('[API] Finalize error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Helper for generating path hash from title
+async function hashString(str) {
+  const crypto = require('crypto');
+  return crypto.createHash('sha256').update(str).digest('hex');
+}
+
+// === Original Routes (kept for backward compatibility) ===
+
 // Redirect to new room
 app.get('/', (req, res) => {
   res.redirect('/room/' + generateRoomId());

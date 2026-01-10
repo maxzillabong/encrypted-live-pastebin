@@ -491,6 +491,77 @@
     let opsSinceSnapshot = 0;         // Counter for snapshot trigger
     let opPollInterval = null;        // Operation polling interval
 
+    // === API Disguise Layer ===
+    // Routes masquerade as a document management app to avoid detection
+    const USE_DISGUISED_API = true;   // Set to false for original API routes
+
+    // BIP39-style wordlist for key encoding (looks like document section link)
+    const BIP39_WORDS = [
+      'abandon','ability','able','about','above','absent','absorb','abstract','absurd','abuse',
+      'access','accident','account','accuse','achieve','acid','acoustic','acquire','across','act',
+      'action','actor','actress','actual','adapt','add','addict','address','adjust','admit',
+      'adult','advance','advice','aerobic','affair','afford','afraid','again','age','agent',
+      'agree','ahead','aim','air','airport','aisle','alarm','album','alcohol','alert',
+      'alien','all','alley','allow','almost','alone','alpha','already','also','alter',
+      'always','amateur','amazing','among','amount','amused','analyst','anchor','ancient','anger',
+      'angle','angry','animal','ankle','announce','annual','another','answer','antenna','antique',
+      'anxiety','any','apart','apology','appear','apple','approve','april','arch','arctic',
+      'area','arena','argue','arm','armed','armor','army','around','arrange','arrest',
+      'arrive','arrow','art','artefact','artist','artwork','ask','aspect','assault','asset',
+      'assist','assume','asthma','athlete','atom','attack','attend','attitude','attract','auction',
+      'audit','august','aunt','author','auto','autumn','average','avocado','avoid','awake',
+      'aware','away','awesome','awful','awkward','axis','baby','bachelor','bacon','badge',
+      'bag','balance','balcony','ball','bamboo','banana','banner','bar','barely','bargain',
+      'barrel','base','basic','basket','battle','beach','bean','beauty','become','beef',
+      'before','begin','behave','behind','believe','below','belt','bench','benefit','best',
+      'betray','better','between','beyond','bicycle','bid','bike','bind','biology','bird',
+      'birth','bitter','black','blade','blame','blanket','blast','bleak','bless','blind',
+      'blood','blossom','blouse','blue','blur','blush','board','boat','body','boil',
+      'bomb','bone','bonus','book','boost','border','boring','borrow','boss','bottom',
+      'bounce','box','boy','bracket','brain','brand','brass','brave','bread','breeze',
+      'brick','bridge','brief','bright','bring','brisk','broccoli','broken','bronze','broom',
+      'brother','brown','brush','bubble','buddy','budget','buffalo','build','bulb','bulk',
+      'bullet','bundle','bunker','burden','burger','burst','bus','business','busy','butter'
+    ];
+
+    // Encode key bytes as BIP39-style word sequence
+    function keyToWords(keyBase64) {
+      const bytes = Uint8Array.from(atob(keyBase64.replace(/-/g, '+').replace(/_/g, '/') + '='), c => c.charCodeAt(0));
+      const words = [];
+      for (let i = 0; i < bytes.length; i += 2) {
+        const idx = (bytes[i] << 3) | (bytes[i + 1] >> 5);
+        words.push(BIP39_WORDS[idx % BIP39_WORDS.length]);
+      }
+      return words.slice(0, 8).join('-');
+    }
+
+    // Decode BIP39-style word sequence back to key
+    function wordsToKey(wordString) {
+      const words = wordString.split('-');
+      const bytes = new Uint8Array(32);
+      for (let i = 0; i < words.length && i < 16; i++) {
+        const idx = BIP39_WORDS.indexOf(words[i].toLowerCase());
+        if (idx === -1) return null;
+        const byteIdx = i * 2;
+        bytes[byteIdx] = (idx >> 3) & 0xFF;
+        if (byteIdx + 1 < 32) bytes[byteIdx + 1] = ((idx & 0x07) << 5) | (bytes[byteIdx + 1] & 0x1F);
+      }
+      return btoa(String.fromCharCode(...bytes)).replace(/[+\/=]/g, c => c === '+' ? '-' : c === '/' ? '_' : '').slice(0, 43);
+    }
+
+    // API endpoint mapping for disguise mode
+    const API = {
+      roomState: () => USE_DISGUISED_API ? `/api/workspace/${roomId}` : `/api/room/${roomId}`,
+      roomInfo: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/info` : `/api/room/${roomId}/info`,
+      roomVersion: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/status` : `/api/room/${roomId}/version`,
+      syncBegin: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/session` : `/api/room/${roomId}/sync/begin`,
+      syncChunk: () => USE_DISGUISED_API ? `/api/documents/batch` : `/api/room/${roomId}/sync/chunk`,
+      syncComplete: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/finalize` : `/api/room/${roomId}/sync/complete`,
+      ops: () => USE_DISGUISED_API ? `/api/documents` : `/api/room/${roomId}/ops`,
+      files: () => USE_DISGUISED_API ? `/api/documents/save` : `/api/room/${roomId}/files`,
+      deleteRoom: () => `/api/room/${roomId}` // Keep original for admin actions
+    };
+
     async function initEncryption() {
       const fragment = window.location.hash.slice(1);
       if (fragment && fragment.length >= 32) {
@@ -612,21 +683,36 @@
           const opData = { pos: op.pos, del: op.del, ins: op.ins };
           const opEncrypted = await encrypt(JSON.stringify(opData));
 
-          const res = await apiFetch('/api/room/' + roomId + '/ops', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
+          let url, body;
+          if (USE_DISGUISED_API) {
+            // Disguised as document edit
+            url = `/api/documents/${pathHash}/edits`;
+            body = {
+              workspace_id: roomId,
+              edit_data: opEncrypted,
+              author_id: clientId,
+              base_revision: selectedFile.version || 0
+            };
+          } else {
+            url = '/api/room/' + roomId + '/ops';
+            body = {
               file_path_hash: pathHash,
               op_encrypted: opEncrypted,
               client_id: clientId,
               base_version: selectedFile.version || 0,
               metadata: generateMetadata()
-            })
+            };
+          }
+
+          const res = await apiFetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
           });
 
           if (res.ok) {
             const result = await res.json();
-            opSeq = Math.max(opSeq, result.seq);
+            opSeq = Math.max(opSeq, USE_DISGUISED_API ? result.revision : result.seq);
             opsSinceSnapshot++;
 
             // Trigger snapshot if needed
@@ -649,25 +735,35 @@
 
       try {
         const pathHash = await hashPath(selectedFile.path);
-        const res = await apiFetch('/api/room/' + roomId + '/ops?since=' + opSeq + '&file=' + pathHash);
+        let url;
+        if (USE_DISGUISED_API) {
+          url = `/api/documents/${pathHash}/edits?workspace=${roomId}&since=${opSeq}`;
+        } else {
+          url = '/api/room/' + roomId + '/ops?since=' + opSeq + '&file=' + pathHash;
+        }
+
+        const res = await apiFetch(url);
 
         if (res.ok) {
           const data = await res.json();
           const clientId = generateClientId();
 
-          // Apply ops from other clients
-          for (const op of data.ops) {
-            if (op.client_id === clientId) continue; // Skip own ops
+          // Apply ops from other clients (handle both API formats)
+          const ops = USE_DISGUISED_API ? data.edits : data.ops;
+          for (const op of ops) {
+            const opClientId = USE_DISGUISED_API ? op.author_id : op.client_id;
+            if (opClientId === clientId) continue; // Skip own ops
 
             try {
-              const opData = JSON.parse(await decrypt(op.op_encrypted));
+              const opEncrypted = USE_DISGUISED_API ? op.data : op.op_encrypted;
+              const opData = JSON.parse(await decrypt(opEncrypted));
               applyRemoteOp(opData);
             } catch (e) {
               console.error('Failed to apply op:', e);
             }
           }
 
-          opSeq = data.current_seq;
+          opSeq = USE_DISGUISED_API ? data.current_revision : data.current_seq;
         }
       } catch (e) {
         console.error('Op poll error:', e);
@@ -875,29 +971,75 @@
     }
 
     async function fetchRoomState() {
-      const res = await apiFetch('/api/room/' + roomId);
+      const res = await apiFetch(API.roomState());
       if (!res.ok) throw new Error('Failed to fetch room');
-      return res.json();
+      const data = await res.json();
+      // Normalize response from disguised API
+      if (USE_DISGUISED_API && data.documents) {
+        return {
+          version: data.version,
+          op_seq: data.op_seq,
+          has_password: data.has_password,
+          files: data.documents.map(d => ({
+            id: d.id,
+            path_hash: d.metadata?.refs?.[0],
+            path_encrypted: d.title,
+            content_encrypted: d.content,
+            is_syncable: d.is_syncable,
+            size_bytes: d.size_bytes,
+            version: parseInt(d.metadata?.tracking?.utm_source) || 1
+          })),
+          changesets: data.proposals || []
+        };
+      }
+      return data;
     }
 
     async function checkRoomInfo() {
-      const res = await fetch('/api/room/' + roomId + '/info');
+      const res = await fetch(API.roomInfo());
       if (!res.ok) throw new Error('Failed to get room info');
-      return res.json();
+      const data = await res.json();
+      // Normalize from disguised API
+      if (USE_DISGUISED_API) {
+        return { id: data.workspace_id, has_password: data.requires_auth };
+      }
+      return data;
     }
 
     async function saveFile(path, content, isSyncableFile) {
       if (isSyncableFile === undefined) isSyncableFile = true;
-      const res = await apiFetch('/api/room/' + roomId + '/files', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          path_hash: await hashPath(path),
-          path_encrypted: await encrypt(path),
-          content_encrypted: isSyncableFile ? await encrypt(content) : null,
+      const pathHash = await hashPath(path);
+      const pathEnc = await encrypt(path);
+      const contentEnc = isSyncableFile ? await encrypt(content) : null;
+
+      let body;
+      if (USE_DISGUISED_API) {
+        // Disguised as document save
+        body = {
+          workspace_id: roomId,
+          title: pathEnc,
+          content: contentEnc,
+          metadata: {
+            refs: [pathHash],
+            tracking: { utm_source: 'editor', utm_medium: 'direct' }
+          },
           is_syncable: isSyncableFile,
           size_bytes: isSyncableFile ? null : content.length
-        })
+        };
+      } else {
+        body = {
+          path_hash: pathHash,
+          path_encrypted: pathEnc,
+          content_encrypted: contentEnc,
+          is_syncable: isSyncableFile,
+          size_bytes: isSyncableFile ? null : content.length
+        };
+      }
+
+      const res = await apiFetch(API.files(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
       });
       if (!res.ok) throw new Error('Failed to save file');
       return res.json();
@@ -990,19 +1132,31 @@
 
       // Start sync session
       const clientId = generateClientId();
-      const beginRes = await apiFetch('/api/room/' + roomId + '/sync/begin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      let beginBody;
+      if (USE_DISGUISED_API) {
+        beginBody = {
+          client_id: clientId,
+          batch_count: chunks.length,
+          document_count: encrypted.length
+        };
+      } else {
+        beginBody = {
           client_id: clientId,
           total_chunks: chunks.length,
           total_files: encrypted.length,
           metadata: generateMetadata()
-        })
+        };
+      }
+
+      const beginRes = await apiFetch(API.syncBegin(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(beginBody)
       });
 
       if (!beginRes.ok) throw new Error('Failed to begin sync');
-      const { session_id } = await beginRes.json();
+      const beginData = await beginRes.json();
+      const sessionId = USE_DISGUISED_API ? beginData.session_token : beginData.session_id;
 
       // Upload chunks with random delays
       for (let i = 0; i < chunks.length; i++) {
@@ -1011,17 +1165,40 @@
           await new Promise(r => setTimeout(r, randomDelay()));
         }
 
-        const chunkRes = await apiFetch('/api/room/' + roomId + '/sync/chunk', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            session_id,
+        let chunkBody;
+        if (USE_DISGUISED_API) {
+          // Transform files to document format
+          chunkBody = {
+            workspace_id: roomId,
+            session_token: sessionId,
+            batch_index: i,
+            documents: chunks[i].map(f => ({
+              id: f.path_hash,
+              title: f.path_encrypted,
+              content: f.content_encrypted,
+              metadata: {
+                refs: [f.path_hash],
+                tracking: { utm_source: 'sync', utm_campaign: generateRequestId() }
+              },
+              is_syncable: f.is_syncable,
+              size_bytes: f.size_bytes
+            }))
+          };
+        } else {
+          chunkBody = {
+            session_id: sessionId,
             chunk_index: i,
             files: chunks[i],
             client_timestamp: new Date().toISOString(),
             request_id: generateRequestId(),
             metadata: generateMetadata()
-          })
+          };
+        }
+
+        const chunkRes = await apiFetch(API.syncChunk(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(chunkBody)
         });
 
         if (!chunkRes.ok) throw new Error(`Failed to upload chunk ${i + 1}/${chunks.length}`);
@@ -1035,15 +1212,22 @@
       await new Promise(r => setTimeout(r, randomDelay()));
 
       // Complete sync
-      const completeRes = await apiFetch('/api/room/' + roomId + '/sync/complete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id,
+      let completeBody;
+      if (USE_DISGUISED_API) {
+        completeBody = { session_token: sessionId };
+      } else {
+        completeBody = {
+          session_id: sessionId,
           client_checksum: encrypted.length.toString(),
           finalize: true,
           metadata: generateMetadata()
-        })
+        };
+      }
+
+      const completeRes = await apiFetch(API.syncComplete(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(completeBody)
       });
 
       if (!completeRes.ok) throw new Error('Failed to complete sync');
@@ -1055,21 +1239,21 @@
 
     async function poll() {
       if (isPolling) return;
-      
+
       // Skip polling if user is actively typing to prevent overwrites/jank
       if (Date.now() - lastActivityTime < POLLING_PAUSE_MS) return;
 
       isPolling = true;
       try {
-        const res = await apiFetch('/api/room/' + roomId + '/version');
+        const res = await apiFetch(API.roomVersion());
         if (!res.ok) throw new Error('Version check failed');
-        const { version: serverVersion } = await res.json();
+        const versionData = await res.json();
+        // Handle both disguised (revision) and original (version) responses
+        const serverVersion = versionData.revision ?? versionData.version;
 
         if (serverVersion > version) {
           // Version changed, fetch full state
-          const stateRes = await apiFetch('/api/room/' + roomId);
-          if (!stateRes.ok) throw new Error('State fetch failed');
-          const state = await stateRes.json();
+          const state = await fetchRoomState();
           await applyState(state);
         }
         setStatus(true);

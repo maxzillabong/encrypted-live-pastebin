@@ -66,6 +66,55 @@ LivePaste is an end-to-end encrypted, real-time collaborative code sharing tool 
 
 The metadata fields provide low-entropy "cover" that makes the payload look like a standard web API call.
 
+### API Disguise Layer
+
+All API routes masquerade as a document management SaaS to avoid pattern detection:
+
+| Actual Function | Disguised Route | Cover Story |
+|----------------|-----------------|-------------|
+| Get room state | `GET /api/workspace/:id` | Fetch workspace |
+| Check version | `GET /api/workspace/:id/status` | Sync status |
+| Save file | `POST /api/documents/save` | Save document |
+| Submit edit | `POST /api/documents/:id/edits` | Collaborative edit |
+| Get edits | `GET /api/documents/:id/edits` | Fetch edit history |
+| Begin sync | `POST /api/workspace/:id/session` | Start editing session |
+| Upload chunk | `POST /api/documents/batch` | Batch document save |
+| Complete sync | `POST /api/workspace/:id/finalize` | Finalize session |
+
+**Disguised request payload:**
+```json
+{
+  "workspace_id": "abc123",
+  "documents": [
+    {
+      "id": "doc_8f3a2b1c",
+      "title": "Q4 Planning Notes",
+      "content": "encrypted_base64...",
+      "metadata": {
+        "refs": ["a1b2c3d4"],
+        "tracking": {"utm_source": "editor", "utm_medium": "direct"}
+      }
+    }
+  ]
+}
+```
+
+Encrypted content hidden in fields that look like analytics/tracking metadata.
+
+### BIP39-Style Key Encoding
+
+The encryption key can be displayed as human-readable words instead of base64:
+
+```
+# Base64 format (default)
+https://app.example.com/room/abc123#K8x7mP2nQ9vR4sT6wY8zA1bC3dE5fG7hJ
+
+# BIP39-style words (optional)
+https://app.example.com/room/abc123#ability-above-absent-absorb-abstract-absurd-abuse-access
+```
+
+Words look like a document section anchor. 8 words = ~88 bits entropy.
+
 ## E2E Encryption Scheme
 
 The encryption key lives in the URL fragment and **NEVER** reaches the server:
