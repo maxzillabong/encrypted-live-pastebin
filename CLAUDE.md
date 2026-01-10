@@ -135,6 +135,54 @@ const CHUNK_MIN_DELAY = 200;           // Min delay between chunks (ms)
 const CHUNK_MAX_DELAY = 800;           // Max delay between chunks (ms)
 ```
 
+## Real-Time Delta Sync (Operations)
+
+For ongoing edits, we use tiny encrypted deltas instead of full file content. This looks exactly like Google Docs traffic.
+
+### Why Operations?
+
+| Full Content | Operations |
+|-------------|------------|
+| Edit 5 chars → Send 50KB file | Edit 5 chars → Send ~200 bytes |
+| High entropy in large blob | Small encrypted payload |
+| Looks like data exfil | Looks like real-time editing |
+
+### Operation Format
+
+```javascript
+// Before encryption
+{
+  "pos": 1234,    // Character offset
+  "del": 5,       // Characters deleted
+  "ins": "hello"  // Text inserted
+}
+
+// After encryption: ~100-300 bytes base64
+```
+
+### Operation Flow
+
+```
+User types → Capture change → Encrypt op → POST /ops (tiny payload)
+                                              ↓
+                            ← Poll /ops?since=N ← Other clients
+```
+
+### Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/room/:id/ops` | Submit operation (~200 bytes) |
+| GET | `/api/room/:id/ops?since=N` | Get ops since sequence N |
+| POST | `/api/room/:id/files/:hash/snapshot` | Compact ops into content |
+
+### Automatic Snapshots
+
+After 50 operations on a file, the client sends a snapshot to compact:
+- Updates file content in database
+- Deletes old operations
+- New clients start from snapshot + recent ops
+
 ## Database Schema
 
 ```sql
@@ -142,7 +190,8 @@ const CHUNK_MAX_DELAY = 800;           // Max delay between chunks (ms)
 CREATE TABLE rooms (
     id VARCHAR(32) PRIMARY KEY,
     version BIGINT NOT NULL DEFAULT 0,
-    password_hash TEXT,                     -- bcrypt hash (NULL = no password)
+    op_seq BIGINT NOT NULL DEFAULT 0,        -- operation sequence counter
+    password_hash TEXT,                      -- bcrypt hash (NULL = no password)
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -151,14 +200,27 @@ CREATE TABLE rooms (
 CREATE TABLE files (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-    path_hash VARCHAR(64) NOT NULL,         -- SHA-256 hash for upsert
-    path_encrypted TEXT NOT NULL,           -- encrypted path
-    content_encrypted TEXT,                 -- encrypted content (NULL for binary)
+    path_hash VARCHAR(64) NOT NULL,          -- SHA-256 hash for upsert
+    path_encrypted TEXT NOT NULL,            -- encrypted path
+    content_encrypted TEXT,                  -- encrypted content (NULL for binary)
     is_syncable BOOLEAN NOT NULL DEFAULT true,
-    size_bytes BIGINT,                      -- for non-syncable files
+    size_bytes BIGINT,                       -- for non-syncable files
     version BIGINT NOT NULL DEFAULT 1,
+    snapshot_seq BIGINT NOT NULL DEFAULT 0,  -- op_seq when last snapshotted
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(room_id, path_hash)
+);
+
+-- Operations (tiny deltas for real-time editing)
+CREATE TABLE operations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    file_path_hash VARCHAR(64) NOT NULL,     -- which file
+    seq BIGINT NOT NULL,                     -- sequence number for ordering
+    op_encrypted TEXT NOT NULL,              -- encrypted: {pos, del, ins}
+    client_id VARCHAR(64),                   -- for filtering own ops
+    base_version BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Changesets for AI/collaborator proposals
@@ -220,6 +282,14 @@ CREATE TABLE changes (
 | POST | `/api/room/:id/sync/chunk` | Upload file chunk |
 | POST | `/api/room/:id/sync/complete` | Complete sync |
 | POST | `/api/room/:id/sync` | Legacy bulk sync (backward compat) |
+
+### Operations (Real-Time Deltas)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/room/:id/ops` | Submit tiny operation |
+| GET | `/api/room/:id/ops?since=N` | Get ops since sequence N |
+| POST | `/api/room/:id/files/:hash/snapshot` | Compact ops to snapshot |
 
 ### Changesets
 

@@ -465,6 +465,17 @@
     let roomPassword = sessionStorage.getItem('room_password_' + roomId) || '';
     let hasPassword = false;
 
+    // === Operation-based sync (tiny deltas for Zscaler stealth) ===
+    let opSeq = 0;                    // Current operation sequence from server
+    let pendingOps = [];              // Ops waiting to be sent
+    let isApplyingRemoteOps = false;  // Flag to prevent echo
+    let opSendTimeout = null;         // Debounce for batching local ops
+    const OP_SEND_DELAY = 100;        // Batch ops within 100ms
+    const OP_POLL_INTERVAL = 1000;    // Poll for ops every 1s (faster than full state poll)
+    const SNAPSHOT_THRESHOLD = 50;    // Snapshot after 50 ops
+    let opsSinceSnapshot = 0;         // Counter for snapshot trigger
+    let opPollInterval = null;        // Operation polling interval
+
     async function initEncryption() {
       const fragment = window.location.hash.slice(1);
       if (fragment && fragment.length >= 32) {
@@ -517,6 +528,204 @@
       const hashBuffer = await crypto.subtle.digest('SHA-256', encoded);
       const hashArray = Array.from(new Uint8Array(hashBuffer));
       return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // === Operation functions (tiny deltas instead of full content) ===
+
+    // Convert CodeMirror position to character offset
+    function posToOffset(doc, pos) {
+      let offset = 0;
+      for (let i = 0; i < pos.line; i++) {
+        offset += doc.getLine(i).length + 1; // +1 for newline
+      }
+      offset += pos.ch;
+      return offset;
+    }
+
+    // Convert character offset to CodeMirror position
+    function offsetToPos(doc, offset) {
+      let remaining = offset;
+      for (let line = 0; line < doc.lineCount(); line++) {
+        const lineLength = doc.getLine(line).length + 1;
+        if (remaining < lineLength) {
+          return { line, ch: remaining };
+        }
+        remaining -= lineLength;
+      }
+      // Past end of doc
+      const lastLine = doc.lineCount() - 1;
+      return { line: lastLine, ch: doc.getLine(lastLine).length };
+    }
+
+    // Capture local edit and queue as operation
+    function captureLocalOp(cm, change) {
+      if (isApplyingRemoteOps) return; // Don't capture ops we're applying
+      if (!selectedFile || !selectedFile.is_syncable) return;
+
+      const doc = cm.getDoc();
+      const pos = posToOffset(doc, change.from);
+      const removedText = change.removed.join('\n');
+      const insertedText = change.text.join('\n');
+
+      const op = {
+        file_path: selectedFile.path,
+        pos: pos,
+        del: removedText.length,
+        ins: insertedText
+      };
+
+      pendingOps.push(op);
+      scheduleSendOps();
+    }
+
+    // Schedule sending pending ops (debounced)
+    function scheduleSendOps() {
+      clearTimeout(opSendTimeout);
+      opSendTimeout = setTimeout(sendPendingOps, OP_SEND_DELAY);
+    }
+
+    // Send pending ops to server
+    async function sendPendingOps() {
+      if (pendingOps.length === 0) return;
+
+      const opsToSend = pendingOps.splice(0, pendingOps.length);
+      const clientId = generateClientId();
+
+      for (const op of opsToSend) {
+        try {
+          const pathHash = await hashPath(op.file_path);
+          const opData = { pos: op.pos, del: op.del, ins: op.ins };
+          const opEncrypted = await encrypt(JSON.stringify(opData));
+
+          const res = await apiFetch('/api/room/' + roomId + '/ops', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              file_path_hash: pathHash,
+              op_encrypted: opEncrypted,
+              client_id: clientId,
+              base_version: selectedFile.version || 0,
+              metadata: generateMetadata()
+            })
+          });
+
+          if (res.ok) {
+            const result = await res.json();
+            opSeq = Math.max(opSeq, result.seq);
+            opsSinceSnapshot++;
+
+            // Trigger snapshot if needed
+            if (opsSinceSnapshot >= SNAPSHOT_THRESHOLD) {
+              await snapshotFile(selectedFile);
+              opsSinceSnapshot = 0;
+            }
+          }
+        } catch (e) {
+          console.error('Failed to send op:', e);
+          // Re-queue failed ops
+          pendingOps.unshift(op);
+        }
+      }
+    }
+
+    // Poll for operations from other clients
+    async function pollOps() {
+      if (!selectedFile || !selectedFile.is_syncable) return;
+
+      try {
+        const pathHash = await hashPath(selectedFile.path);
+        const res = await apiFetch('/api/room/' + roomId + '/ops?since=' + opSeq + '&file=' + pathHash);
+
+        if (res.ok) {
+          const data = await res.json();
+          const clientId = generateClientId();
+
+          // Apply ops from other clients
+          for (const op of data.ops) {
+            if (op.client_id === clientId) continue; // Skip own ops
+
+            try {
+              const opData = JSON.parse(await decrypt(op.op_encrypted));
+              applyRemoteOp(opData);
+            } catch (e) {
+              console.error('Failed to apply op:', e);
+            }
+          }
+
+          opSeq = data.current_seq;
+        }
+      } catch (e) {
+        console.error('Op poll error:', e);
+      }
+    }
+
+    // Apply a remote operation to the editor
+    function applyRemoteOp(op) {
+      if (!cmEditor) return;
+
+      isApplyingRemoteOps = true;
+      try {
+        const doc = cmEditor.getDoc();
+        const from = offsetToPos(doc, op.pos);
+        const to = offsetToPos(doc, op.pos + op.del);
+
+        // Preserve cursor position
+        const cursor = cmEditor.getCursor();
+        const scrollInfo = cmEditor.getScrollInfo();
+
+        cmEditor.replaceRange(op.ins, from, to, 'remote');
+
+        // Restore cursor if it was after the edit
+        cmEditor.setCursor(cursor);
+        cmEditor.scrollTo(scrollInfo.left, scrollInfo.top);
+
+        // Update local file content
+        if (selectedFile) {
+          selectedFile.content = cmEditor.getValue();
+        }
+      } finally {
+        isApplyingRemoteOps = false;
+      }
+    }
+
+    // Snapshot a file (compact ops into content)
+    async function snapshotFile(file) {
+      if (!file || !file.is_syncable) return;
+
+      try {
+        const pathHash = await hashPath(file.path);
+        const contentEncrypted = await encrypt(file.content);
+
+        const res = await apiFetch('/api/room/' + roomId + '/files/' + pathHash + '/snapshot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            content_encrypted: contentEncrypted,
+            through_seq: opSeq,
+            metadata: generateMetadata()
+          })
+        });
+
+        if (res.ok) {
+          console.log('Snapshot created for', file.path);
+        }
+      } catch (e) {
+        console.error('Snapshot failed:', e);
+      }
+    }
+
+    // Start operation polling for a file
+    function startOpPolling() {
+      stopOpPolling();
+      opPollInterval = setInterval(pollOps, OP_POLL_INTERVAL);
+    }
+
+    // Stop operation polling
+    function stopOpPolling() {
+      if (opPollInterval) {
+        clearInterval(opPollInterval);
+        opPollInterval = null;
+      }
     }
 
     const SYNCABLE_EXT = new Set(['.js','.ts','.jsx','.tsx','.mjs','.cjs','.py','.java','.kt','.go','.rs','.rb','.php','.swift','.c','.cpp','.h','.cs','.lua','.sh','.bash','.json','.yaml','.yml','.toml','.xml','.html','.htm','.css','.scss','.sass','.md','.mdx','.txt','.sql','.vue','.svelte','.env','.gitignore','.dockerfile']);
@@ -875,6 +1084,7 @@
 
     async function applyState(state) {
       version = state.version;
+      opSeq = state.op_seq || 0; // Track operation sequence for delta sync
       document.getElementById('versionBadge').textContent = version;
       files = await Promise.all(state.files.map(async f => ({
         ...f,
@@ -1002,6 +1212,12 @@
     }
 
     function selectFile(file) {
+      // Flush pending ops for previous file before switching
+      if (pendingOps.length > 0) {
+        sendPendingOps();
+      }
+      stopOpPolling();
+
       selectedFile = file;
       renderFileTree();
       document.getElementById('fileHeader').textContent = file.path;
@@ -1040,19 +1256,28 @@
           autoCloseBrackets: true
         });
         cmEditor.on('change', handleEditorChange);
+        // Capture operations for delta sync (Zscaler stealth)
+        cmEditor.on('change', captureLocalOp);
       } else {
         // Only update if content actually changed (preserve scroll/cursor otherwise)
         const currentContent = cmEditor.getValue();
         if (currentContent !== newContent) {
+          isApplyingRemoteOps = true; // Prevent capturing this as a local op
           const scrollInfo = cmEditor.getScrollInfo();
           const cursor = cmEditor.getCursor();
           cmEditor.setValue(newContent);
           cmEditor.scrollTo(scrollInfo.left, scrollInfo.top);
           cmEditor.setCursor(cursor);
+          isApplyingRemoteOps = false;
         }
         cmEditor.setOption('mode', mode);
       }
       cmEditor.refresh();
+
+      // Start polling for ops on this file
+      if (file.is_syncable) {
+        startOpPolling();
+      }
     }
 
     function showDiffView(change) {
