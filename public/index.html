@@ -331,6 +331,7 @@
     <button class="btn btn-secondary" id="passwordBtn" onclick="showSetPasswordModal()" title="Set room password">&#128272;</button>
     <button class="btn btn-danger" onclick="confirmKillRoom()" title="Delete Room" style="background:#e94560;color:white;border:none">&#128163;</button>
     <div class="status">
+      <span id="isolationWarning" style="display:none;background:#e94560;color:white;padding:2px 6px;border-radius:4px;font-size:0.75rem;cursor:help" title="Browser isolation detected - your organization may be able to see decrypted content">ISOLATED</span>
       <span id="passwordStatus" style="display:none">&#128274;</span>
       <span>&#128274; E2E</span>
       <div class="status-dot" id="statusDot"></div>
@@ -1793,8 +1794,76 @@
       }
     }
 
+    // Detect browser isolation (Zscaler Cloud Browser, Menlo, etc.)
+    async function detectBrowserIsolation() {
+      const signs = [];
+
+      // Check 1: Clipboard API blocked
+      try {
+        await navigator.clipboard.readText();
+      } catch (e) {
+        if (e.name === 'NotAllowedError' || e.message.includes('denied')) {
+          signs.push('clipboard_blocked');
+        }
+      }
+
+      // Check 2: Known isolation user agents / injected elements
+      const ua = navigator.userAgent.toLowerCase();
+      const isolationHints = ['menlo', 'isolation', 'cloudflare-browser', 'zscaler', 'symantec-ws'];
+      for (const hint of isolationHints) {
+        if (ua.includes(hint)) signs.push('ua_' + hint);
+      }
+
+      // Check 3: Look for injected isolation scripts/elements
+      const scripts = document.querySelectorAll('script[src*="isolation"], script[src*="menlo"], script[src*="zscaler"]');
+      if (scripts.length > 0) signs.push('injected_scripts');
+
+      // Check 4: Check for isolation-specific globals
+      if (window.__isolation__ || window.__menlo__ || window.__zscaler__) {
+        signs.push('isolation_global');
+      }
+
+      // Check 5: Input latency test (pixel streaming adds ~50-200ms)
+      const latencyTest = await measureInputLatency();
+      if (latencyTest > 100) signs.push('high_latency_' + Math.round(latencyTest) + 'ms');
+
+      if (signs.length > 0) {
+        console.warn('Browser isolation detected:', signs);
+        document.getElementById('isolationWarning').style.display = 'inline';
+        document.getElementById('isolationWarning').title =
+          'Browser isolation detected (' + signs.join(', ') + ') - your organization may be able to see decrypted content';
+      }
+    }
+
+    function measureInputLatency() {
+      return new Promise(resolve => {
+        const start = performance.now();
+        const input = document.createElement('input');
+        input.style.cssText = 'position:fixed;top:-100px;opacity:0';
+        document.body.appendChild(input);
+        input.focus();
+
+        const handler = () => {
+          const latency = performance.now() - start;
+          input.remove();
+          resolve(latency);
+        };
+
+        input.addEventListener('focus', handler, { once: true });
+
+        // Fallback timeout
+        setTimeout(() => {
+          input.remove();
+          resolve(0);
+        }, 500);
+      });
+    }
+
     async function init() {
       await initEncryption();
+
+      // Check for browser isolation
+      detectBrowserIsolation();
 
       // Check if room has password
       try {
