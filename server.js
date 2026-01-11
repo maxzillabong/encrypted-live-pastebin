@@ -126,6 +126,16 @@ async function getRoomState(roomId, sinceVersion = 0, limit = 1000, offset = 0) 
     [roomId, sinceVersion, limit, offset]
   );
 
+  // Get deleted files since the requested version (for delta sync)
+  let deletedPathHashes = [];
+  if (sinceVersion > 0) {
+    const deletedResult = await pool.query(
+      'SELECT path_hash FROM deleted_files WHERE room_id = $1 AND deleted_at_version > $2',
+      [roomId, sinceVersion]
+    );
+    deletedPathHashes = deletedResult.rows.map(r => r.path_hash);
+  }
+
   const changesetsResult = await pool.query(
     "SELECT c.id, c.author_encrypted, c.message_encrypted, c.status, c.created_at, json_agg(json_build_object('id', ch.id, 'file_path_encrypted', ch.file_path_encrypted, 'old_content_encrypted', ch.old_content_encrypted, 'new_content_encrypted', ch.new_content_encrypted, 'diff_encrypted', ch.diff_encrypted, 'status', ch.status)) FILTER (WHERE ch.id IS NOT NULL) as changes FROM changesets c LEFT JOIN changes ch ON ch.changeset_id = c.id WHERE c.room_id = $1 AND c.status = 'pending' GROUP BY c.id ORDER BY c.created_at DESC",
     [roomId]
@@ -135,12 +145,29 @@ async function getRoomState(roomId, sinceVersion = 0, limit = 1000, offset = 0) 
     version,
     op_seq: opSeq,
     files: filesResult.rows,
+    deleted_path_hashes: deletedPathHashes,
     has_more: filesResult.rows.length === limit,
     changesets: changesetsResult.rows.map(cs => ({
       ...cs,
       changes: cs.changes || []
     }))
   };
+}
+
+// Track file deletion for delta sync
+async function trackDeletion(client, roomId, pathHash, version) {
+  await client.query(
+    'INSERT INTO deleted_files (room_id, path_hash, deleted_at_version) VALUES ($1, $2, $3)',
+    [roomId, pathHash, version]
+  );
+}
+
+// Clean up old deletion records (called during room cleanup)
+async function cleanupDeletions(roomId, keepAfterVersion) {
+  await pool.query(
+    'DELETE FROM deleted_files WHERE room_id = $1 AND deleted_at_version < $2',
+    [roomId, keepAfterVersion]
+  );
 }
 
 // === API Routes ===
@@ -400,9 +427,19 @@ app.post('/api/workspace/:id/finalize', requireRoomPassword, async (req, res) =>
     try {
       await client.query('BEGIN');
       const existingResult = await client.query('SELECT id, path_hash FROM files WHERE room_id = $1', [roomId]);
+
+      // Get version for tracking deletions
+      const versionResult = await client.query(
+        'UPDATE rooms SET version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING version',
+        [roomId]
+      );
+      const newVersion = versionResult.rows[0].version;
+
       for (const row of existingResult.rows) {
         if (!session.pathHashes.has(row.path_hash)) {
           await client.query('DELETE FROM files WHERE id = $1', [row.id]);
+          // Track deletion for delta sync
+          await trackDeletion(client, roomId, row.path_hash, newVersion);
         }
       }
       await client.query('COMMIT');
@@ -415,11 +452,14 @@ app.post('/api/workspace/:id/finalize', requireRoomPassword, async (req, res) =>
 
     syncSessions.delete(sessionKey);
     const state = await getRoomState(roomId);
-    
-    // Return full state so client can update UI immediately
+
+    // Return consistent format with both files[] and documents[] for compatibility
     res.json({
       status: 'complete',
       workspace_id: roomId,
+      // Standard format (consistent with other endpoints)
+      files: state.files,
+      // Disguised format (for backward compatibility)
       documents: state.files.map(f => ({
         id: f.id,
         title: f.path_encrypted,
@@ -434,6 +474,7 @@ app.post('/api/workspace/:id/finalize', requireRoomPassword, async (req, res) =>
       })),
       version: state.version,
       op_seq: state.op_seq,
+      deleted_path_hashes: state.deleted_path_hashes,
       documents_synced: session.pathHashes.size
     });
   } catch (err) {
@@ -588,19 +629,44 @@ app.delete('/api/room/:id/files/:fileId', requireRoomPassword, async (req, res) 
   const { id: roomId, fileId } = req.params;
 
   try {
-    const result = await pool.query(
-      'DELETE FROM files WHERE id = $1 AND room_id = $2 RETURNING id',
-      [fileId, roomId]
-    );
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'File not found' });
+      // Get the file's path_hash before deleting
+      const fileResult = await client.query(
+        'SELECT path_hash FROM files WHERE id = $1 AND room_id = $2',
+        [fileId, roomId]
+      );
+
+      if (fileResult.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'File not found' });
+      }
+
+      const pathHash = fileResult.rows[0].path_hash;
+
+      // Delete the file
+      await client.query('DELETE FROM files WHERE id = $1', [fileId]);
+
+      // Update room version and get new version
+      const versionResult = await client.query(
+        'UPDATE rooms SET version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING version',
+        [roomId]
+      );
+      const newVersion = versionResult.rows[0].version;
+
+      // Track deletion for delta sync
+      await trackDeletion(client, roomId, pathHash, newVersion);
+
+      await client.query('COMMIT');
+      res.json({ success: true, version: newVersion });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
     }
-
-    // Update room version
-    await pool.query('UPDATE rooms SET version = version + 1, updated_at = NOW() WHERE id = $1', [roomId]);
-
-    res.json({ success: true });
   } catch (err) {
     console.error('[API] Delete file error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -724,10 +790,19 @@ app.post('/api/room/:id/sync/complete', requireRoomPassword, async (req, res) =>
         [roomId]
       );
 
+      // Get current version for tracking deletions
+      const versionResult = await client.query(
+        'UPDATE rooms SET version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING version',
+        [roomId]
+      );
+      const newVersion = versionResult.rows[0].version;
+
       let deletedCount = 0;
       for (const row of existingResult.rows) {
         if (!session.pathHashes.has(row.path_hash)) {
           await client.query('DELETE FROM files WHERE id = $1', [row.id]);
+          // Track deletion for delta sync
+          await trackDeletion(client, roomId, row.path_hash, newVersion);
           deletedCount++;
         }
       }
@@ -777,9 +852,18 @@ app.post('/api/room/:id/sync', requireRoomPassword, async (req, res) => {
       const existingPaths = new Map(existingResult.rows.map(r => [r.path_hash, r.id]));
       const newPaths = new Set(files.map(f => f.path_hash));
 
+      // Get version for tracking deletions
+      const versionResult = await client.query(
+        'UPDATE rooms SET version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING version',
+        [roomId]
+      );
+      const newVersion = versionResult.rows[0].version;
+
       for (const [pathHash, id] of existingPaths) {
         if (!newPaths.has(pathHash)) {
           await client.query('DELETE FROM files WHERE id = $1', [id]);
+          // Track deletion for delta sync
+          await trackDeletion(client, roomId, pathHash, newVersion);
         }
       }
 
@@ -979,7 +1063,7 @@ app.post('/api/room/:id/changes/:changeId/reject', requireRoomPassword, async (r
 });
 
 // === Operations (tiny deltas for real-time editing) ===
-// These endpoints enable Google Docs-style traffic patterns
+// These endpoints enable Google Docs-style traffic patterns with OT conflict detection
 
 // Submit an operation (tiny encrypted delta)
 app.post('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
@@ -992,6 +1076,44 @@ app.post('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+
+      // Check for OT conflicts: get file's current version and pending ops
+      const fileResult = await client.query(
+        'SELECT version, snapshot_seq FROM files WHERE room_id = $1 AND path_hash = $2',
+        [roomId, file_path_hash]
+      );
+
+      const currentFileVersion = fileResult.rows[0]?.version || 0;
+      const snapshotSeq = fileResult.rows[0]?.snapshot_seq || 0;
+
+      // If base_version is provided and doesn't match current version, check for conflicts
+      if (base_version !== undefined && base_version > 0) {
+        // Get operations that happened since the client's base version
+        const conflictOpsResult = await client.query(
+          'SELECT seq, op_encrypted, client_id FROM operations WHERE room_id = $1 AND file_path_hash = $2 AND seq > $3 ORDER BY seq ASC',
+          [roomId, file_path_hash, snapshotSeq]
+        );
+
+        // Filter out own client's ops
+        const conflictingOps = conflictOpsResult.rows.filter(op => op.client_id !== client_id);
+
+        // If there are conflicting ops from other clients, return conflict info
+        if (conflictingOps.length > 0 && base_version < currentFileVersion) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            error: 'conflict',
+            message: 'Operation conflicts with concurrent edits',
+            current_version: currentFileVersion,
+            base_version: base_version,
+            conflicting_ops: conflictingOps.map(op => ({
+              seq: op.seq,
+              op_encrypted: op.op_encrypted,
+              client_id: op.client_id
+            })),
+            server_timestamp: new Date().toISOString()
+          });
+        }
+      }
 
       // Get next sequence number atomically
       const seqResult = await client.query(
@@ -1011,6 +1133,7 @@ app.post('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
       res.json({
         seq,
         status: 'ok',
+        current_version: currentFileVersion + 1,
         server_timestamp: new Date().toISOString()
       });
     } catch (err) {

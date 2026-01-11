@@ -1342,12 +1342,23 @@ hasMore = normalized.has_more;
         }
       }
 
-      // Note: We don't handle file deletions in this partial sync because
-      // getRoomState only returns *updated* files. To handle deletions correctly
-      // with partial sync, the server would need to return tombstones or we'd
-      // need a different sync mechanism. For now, deletions might require a refresh
-      // or we can implement a "deleted_files" list in the response.
-      // Given the constraints, this is a trade-off for bandwidth.
+      // Handle file deletions from delta sync
+      if (state.deleted_path_hashes && state.deleted_path_hashes.length > 0) {
+        const deletedSet = new Set(state.deleted_path_hashes);
+        const deletedPaths = files.filter(f => deletedSet.has(f.path_hash)).map(f => f.path);
+        files = files.filter(f => !deletedSet.has(f.path_hash));
+
+        // If currently selected file was deleted, clear selection
+        if (selectedFile && deletedSet.has(selectedFile.path_hash)) {
+          console.log(`Selected file "${selectedFile.path}" was deleted by another client`);
+          selectedFile = null;
+          showEmptyState();
+        }
+
+        if (deletedPaths.length > 0) {
+          console.log(`Delta sync: ${deletedPaths.length} file(s) deleted by other clients`);
+        }
+      }
 
       changesets = await Promise.all((state.changesets || []).map(async cs => ({
         ...cs,

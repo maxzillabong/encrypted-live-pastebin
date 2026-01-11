@@ -62,7 +62,17 @@ CREATE TABLE operations (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Deleted files (track recent deletions for delta sync)
+CREATE TABLE deleted_files (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    path_hash VARCHAR(64) NOT NULL,
+    deleted_at_version BIGINT NOT NULL,  -- room version when deleted
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Indexes
+CREATE INDEX idx_deleted_files_room_version ON deleted_files(room_id, deleted_at_version);
 CREATE INDEX idx_files_room_id ON files(room_id);
 CREATE INDEX idx_changesets_room_id ON changesets(room_id);
 CREATE INDEX idx_changesets_status ON changesets(status);

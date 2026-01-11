@@ -290,7 +290,16 @@ CREATE TABLE operations (
     seq BIGINT NOT NULL,                     -- sequence number for ordering
     op_encrypted TEXT NOT NULL,              -- encrypted: {pos, del, ins}
     client_id VARCHAR(64),                   -- for filtering own ops
-    base_version BIGINT NOT NULL DEFAULT 0,
+    base_version BIGINT NOT NULL DEFAULT 0,  -- for OT conflict detection
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Deleted files (for delta sync propagation)
+CREATE TABLE deleted_files (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    path_hash VARCHAR(64) NOT NULL,
+    deleted_at_version BIGINT NOT NULL,      -- room version when deleted
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -660,31 +669,47 @@ curl -X POST http://localhost:8080/api/room/test123/sync/complete \
   -d '{"session_id":"abc123","finalize":true}'
 ```
 
-## Known Limitations & Open Development
-
-### Delta Sync - File Deletions Not Propagated
-
-The delta sync (`?since=N`) only returns *updated* files. When a file is deleted by one client, other clients won't see the deletion until they refresh.
-
-**Potential solutions:**
-1. Add `deleted_path_hashes[]` array to delta sync response
-2. Use tombstone records in the database
-3. Include a `full_sync_required` flag when deletions occur
-
-**Current workaround:** Users must refresh to see deletions from other clients.
-
-### Operations System - Conflict Resolution
-
-The ops-based real-time editing (`POST /api/room/:id/ops`) uses a simple last-write-wins model. True OT (Operational Transformation) or CRDT is not implemented.
-
-**Impact:** Simultaneous edits to the same line by multiple users may result in lost characters.
-
-**Potential improvement:** Implement OT using the existing `base_version` field for conflict detection.
-
-### Response Format Inconsistency
-
-The `/api/workspace/:id/finalize` endpoint returns a different format (`documents[]`) than the standard room state endpoints (`files[]`). The client handles this via normalization, but the API could be unified.
+## Known Limitations & Remaining Work
 
 ### Browser Isolation Detection - Limited Coverage
 
 The isolation detection (Menlo, Zscaler BI, etc.) relies on heuristics that may not catch all isolation environments. False negatives are possible with newer or custom isolation solutions.
+
+### Full CRDT Not Implemented
+
+While basic OT conflict detection is implemented (server returns 409 with conflicting ops), true CRDT or full OT transformation is not implemented. The client is responsible for resolving conflicts when they occur.
+
+## Recently Implemented Features
+
+### Delta Sync - File Deletions (Implemented)
+
+File deletions are now propagated via delta sync:
+- Server tracks deletions in `deleted_files` table with version numbers
+- Delta sync response includes `deleted_path_hashes[]` array
+- Client removes deleted files from local state automatically
+
+### OT Conflict Detection (Implemented)
+
+The ops endpoint now includes conflict detection:
+- Server checks `base_version` against file's current version
+- Returns HTTP 409 with `conflicting_ops[]` when conflicts detected
+- Client receives all conflicting operations to enable resolution
+
+```javascript
+// Conflict response (HTTP 409)
+{
+  "error": "conflict",
+  "current_version": 5,
+  "base_version": 3,
+  "conflicting_ops": [
+    { "seq": 4, "op_encrypted": "...", "client_id": "other-client" }
+  ]
+}
+```
+
+### Response Format Unified (Implemented)
+
+The `/api/workspace/:id/finalize` endpoint now returns both formats:
+- `files[]` - Standard format for consistency
+- `documents[]` - Disguised format for backward compatibility
+- `deleted_path_hashes[]` - For delta sync support
