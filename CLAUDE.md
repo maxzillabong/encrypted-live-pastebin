@@ -143,15 +143,16 @@ const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciph
 
 ## Polling Architecture
 
-**Simple 2-second polling** (not long polling):
+**Simple 2-second polling with delta sync** (not long polling):
 
 ```javascript
 // Client polls every 2 seconds
 setInterval(async () => {
   const { version } = await fetch('/api/room/:id/version');
   if (version > localVersion) {
-    const state = await fetch('/api/room/:id');
-    applyState(state);
+    // Fetch only files updated since our last known version
+    const state = await fetch(`/api/room/:id?since=${localVersion}`);
+    mergeState(state); // Merge, don't replace
   }
 }, 2000);
 ```
@@ -161,6 +162,27 @@ setInterval(async () => {
 const POLLING_PAUSE_MS = 2000;
 if (Date.now() - lastActivityTime < POLLING_PAUSE_MS) return;
 ```
+
+## Chunked Download System
+
+Initial room state is fetched in chunks for large file counts (proxy-friendly):
+
+```javascript
+const CHUNK_LIMIT = 50; // Files per chunk
+let offset = 0;
+let allFiles = [];
+
+while (true) {
+  const res = await fetch(`/api/room/:id?since=0&limit=${CHUNK_LIMIT}&offset=${offset}`);
+  const { files, has_more } = await res.json();
+  allFiles.push(...files);
+  if (!has_more) break;
+  offset += CHUNK_LIMIT;
+  await delay(50); // Brief pause between chunks
+}
+```
+
+This prevents large responses that might trigger DLP alerts on initial load.
 
 ## Chunked Upload System
 
@@ -309,6 +331,12 @@ CREATE TABLE changes (
 | GET | `/api/room/:id/version` | Get version only (for polling) |
 | DELETE | `/api/room/:id` | Delete room (kill switch) |
 
+**Room state query parameters** (for delta sync and chunked loading):
+- `?since=N` - Only return files with `version > N` (for delta updates)
+- `?limit=N` - Maximum files to return (default: 1000)
+- `?offset=N` - Skip first N files (for pagination)
+- Response includes `has_more: true` if more files available
+
 ### Password Management
 
 | Method | Endpoint | Description |
@@ -449,8 +477,9 @@ livepaste/
 ├── public/
 │   └── index.html         # Built frontend (minified, no comments)
 ├── init.sql               # Database schema
-├── docker-compose.yml     # Postgres + App
+├── docker-compose.yml     # Postgres + App (internal network only)
 ├── Dockerfile             # Multi-stage Node app container
+├── Caddyfile              # Caddy reverse proxy config (reference)
 ├── .github/
 │   └── workflows/
 │       └── deploy.yml     # CI/CD workflow for Hetzner deployment
@@ -630,3 +659,32 @@ curl -X POST http://localhost:8080/api/room/test123/sync/complete \
   -H "Content-Type: application/json" \
   -d '{"session_id":"abc123","finalize":true}'
 ```
+
+## Known Limitations & Open Development
+
+### Delta Sync - File Deletions Not Propagated
+
+The delta sync (`?since=N`) only returns *updated* files. When a file is deleted by one client, other clients won't see the deletion until they refresh.
+
+**Potential solutions:**
+1. Add `deleted_path_hashes[]` array to delta sync response
+2. Use tombstone records in the database
+3. Include a `full_sync_required` flag when deletions occur
+
+**Current workaround:** Users must refresh to see deletions from other clients.
+
+### Operations System - Conflict Resolution
+
+The ops-based real-time editing (`POST /api/room/:id/ops`) uses a simple last-write-wins model. True OT (Operational Transformation) or CRDT is not implemented.
+
+**Impact:** Simultaneous edits to the same line by multiple users may result in lost characters.
+
+**Potential improvement:** Implement OT using the existing `base_version` field for conflict detection.
+
+### Response Format Inconsistency
+
+The `/api/workspace/:id/finalize` endpoint returns a different format (`documents[]`) than the standard room state endpoints (`files[]`). The client handles this via normalization, but the API could be unified.
+
+### Browser Isolation Detection - Limited Coverage
+
+The isolation detection (Menlo, Zscaler BI, etc.) relies on heuristics that may not catch all isolation environments. False negatives are possible with newer or custom isolation solutions.

@@ -557,7 +557,8 @@
           ? `/api/workspace/${roomId}${params}` 
           : `/api/room/${roomId}${params}`;
       },
-      roomInfo: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/info` : `/api/room/${roomId}/info`,      roomVersion: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/status` : `/api/room/${roomId}/version`,
+      roomInfo: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/info` : `/api/room/${roomId}/info`,
+      roomVersion: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/status` : `/api/room/${roomId}/version`,
       syncBegin: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/session` : `/api/room/${roomId}/sync/begin`,
       syncChunk: () => USE_DISGUISED_API ? `/api/documents/batch` : `/api/room/${roomId}/sync/chunk`,
       syncComplete: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/finalize` : `/api/room/${roomId}/sync/complete`,
@@ -1277,9 +1278,11 @@ hasMore = normalized.has_more;
 
       isPolling = true;
       try {
-        const res = await apiFetch('/api/room/' + roomId + '/version');
+        const res = await apiFetch(API.roomVersion());
         if (!res.ok) throw new Error('Version check failed');
-        const { version: serverVersion } = await res.json();
+        const versionData = await res.json();
+        // Handle both disguised (revision) and original (version) responses
+        const serverVersion = versionData.revision ?? versionData.version;
 
         if (serverVersion > version) {
           // Version changed, fetch ONLY updates (partial sync)
@@ -1764,16 +1767,16 @@ hasMore = normalized.has_more;
           return;
         }
 
-        showToast(`Syncing ${e.length} files...`);
-        const o = await syncFiles(e);
-        
+        showToast(`Syncing ${fileList.length} files...`);
+        const syncResult = await syncFiles(fileList);
+
         // Normalize response if using disguised API
-        let normalizedState = o;
-        if (USE_DISGUISED_API && o.documents) {
+        let normalizedState = syncResult;
+        if (USE_DISGUISED_API && syncResult.documents) {
           normalizedState = {
-            version: o.version,
-            op_seq: o.op_seq,
-            files: o.documents.map(d => ({
+            version: syncResult.version,
+            op_seq: syncResult.op_seq,
+            files: syncResult.documents.map(d => ({
               id: d.id,
               path_hash: d.metadata?.refs?.[0],
               path_encrypted: d.title,
@@ -1782,11 +1785,12 @@ hasMore = normalized.has_more;
               size_bytes: d.size_bytes,
               version: parseInt(d.metadata?.tracking?.utm_source) || 1
             })),
-            changesets: o.proposals || []
+            changesets: syncResult.proposals || []
           };
         }
-        
-        await applyState(normalizedState), showToast(`Uploaded ${e.length} files (${t} skipped)`)
+
+        await applyState(normalizedState);
+        showToast(`Uploaded ${fileList.length} files (${skippedCount} skipped)`);
       } catch (e) {
         if (e.name !== 'AbortError') {
           console.error('Folder upload error:', e);
