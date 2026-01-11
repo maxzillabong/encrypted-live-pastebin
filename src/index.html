@@ -1296,6 +1296,7 @@ hasMore = normalized.has_more;
 
       let chunkIndex = 0;
       let totalFiles = 0;
+      let filesUploaded = 0;
       let currentChunk = [];
       let currentChunkSize = 0;
 
@@ -1313,8 +1314,10 @@ hasMore = normalized.has_more;
               await new Promise(r => setTimeout(r, randomDelay()));
             }
             await uploadChunk(sessionId, chunkIndex, currentChunk);
+            filesUploaded += currentChunk.length;
             chunkIndex++;
-            if (onProgress) onProgress({ chunksUploaded: chunkIndex, filesProcessed: totalFiles });
+            // Report progress after upload completes, not after encryption
+            if (onProgress) onProgress({ chunksUploaded: chunkIndex, filesUploaded, filesProcessed: totalFiles });
 
             // Release chunk memory
             currentChunk = [];
@@ -1325,9 +1328,6 @@ hasMore = normalized.has_more;
           currentChunkSize += fileSize;
           totalFiles++;
         }
-
-        // Update progress after each batch
-        if (onProgress) onProgress({ chunksUploaded: chunkIndex, filesProcessed: totalFiles });
       }
 
       // Upload remaining files in the last chunk
@@ -1336,7 +1336,9 @@ hasMore = normalized.has_more;
           await new Promise(r => setTimeout(r, randomDelay()));
         }
         await uploadChunk(sessionId, chunkIndex, currentChunk);
+        filesUploaded += currentChunk.length;
         chunkIndex++;
+        if (onProgress) onProgress({ chunksUploaded: chunkIndex, filesUploaded, filesProcessed: totalFiles });
       }
 
       // Small delay before completing
@@ -1377,8 +1379,8 @@ hasMore = normalized.has_more;
         }
       }
 
-      return streamingSyncFiles(batchIterator(), ({ filesProcessed }) => {
-        const progress = Math.round((filesProcessed / fileList.length) * 100);
+      return streamingSyncFiles(batchIterator(), ({ filesUploaded }) => {
+        const progress = Math.round((filesUploaded / fileList.length) * 100);
         showToast(`Syncing... ${progress}%`);
       });
     }
@@ -1915,8 +1917,8 @@ hasMore = normalized.has_more;
 
         const syncResult = await streamingSyncFiles(
           streamingScan(dirHandle),
-          ({ filesProcessed, chunksUploaded }) => {
-            showToast(`Uploading... ${filesProcessed} files (${chunksUploaded} chunks)`);
+          ({ filesUploaded, chunksUploaded }) => {
+            showToast(`Uploading... ${filesUploaded} files (${chunksUploaded} chunks)`);
           }
         );
 
@@ -1994,8 +1996,8 @@ hasMore = normalized.has_more;
       showToast('Uploading...');
       const newState = await streamingSyncFiles(
         streamingFileInput(),
-        ({ filesProcessed }) => {
-          showToast(`Uploading... ${filesProcessed} files`);
+        ({ filesUploaded }) => {
+          showToast(`Uploading... ${filesUploaded} files`);
         }
       );
       await applyState(newState);
