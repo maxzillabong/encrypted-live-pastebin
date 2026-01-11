@@ -143,15 +143,16 @@ const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciph
 
 ## Polling Architecture
 
-**Simple 2-second polling** (not long polling):
+**Simple 2-second polling with delta sync** (not long polling):
 
 ```javascript
 // Client polls every 2 seconds
 setInterval(async () => {
   const { version } = await fetch('/api/room/:id/version');
   if (version > localVersion) {
-    const state = await fetch('/api/room/:id');
-    applyState(state);
+    // Fetch only files updated since our last known version
+    const state = await fetch(`/api/room/:id?since=${localVersion}`);
+    mergeState(state); // Merge, don't replace
   }
 }, 2000);
 ```
@@ -161,6 +162,27 @@ setInterval(async () => {
 const POLLING_PAUSE_MS = 2000;
 if (Date.now() - lastActivityTime < POLLING_PAUSE_MS) return;
 ```
+
+## Chunked Download System
+
+Initial room state is fetched in chunks for large file counts (proxy-friendly):
+
+```javascript
+const CHUNK_LIMIT = 50; // Files per chunk
+let offset = 0;
+let allFiles = [];
+
+while (true) {
+  const res = await fetch(`/api/room/:id?since=0&limit=${CHUNK_LIMIT}&offset=${offset}`);
+  const { files, has_more } = await res.json();
+  allFiles.push(...files);
+  if (!has_more) break;
+  offset += CHUNK_LIMIT;
+  await delay(50); // Brief pause between chunks
+}
+```
+
+This prevents large responses that might trigger DLP alerts on initial load.
 
 ## Chunked Upload System
 
@@ -268,7 +290,16 @@ CREATE TABLE operations (
     seq BIGINT NOT NULL,                     -- sequence number for ordering
     op_encrypted TEXT NOT NULL,              -- encrypted: {pos, del, ins}
     client_id VARCHAR(64),                   -- for filtering own ops
-    base_version BIGINT NOT NULL DEFAULT 0,
+    base_version BIGINT NOT NULL DEFAULT 0,  -- for OT conflict detection
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Deleted files (for delta sync propagation)
+CREATE TABLE deleted_files (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    path_hash VARCHAR(64) NOT NULL,
+    deleted_at_version BIGINT NOT NULL,      -- room version when deleted
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -308,6 +339,12 @@ CREATE TABLE changes (
 | GET | `/api/room/:id` | Get room state (password protected) |
 | GET | `/api/room/:id/version` | Get version only (for polling) |
 | DELETE | `/api/room/:id` | Delete room (kill switch) |
+
+**Room state query parameters** (for delta sync and chunked loading):
+- `?since=N` - Only return files with `version > N` (for delta updates)
+- `?limit=N` - Maximum files to return (default: 1000)
+- `?offset=N` - Skip first N files (for pagination)
+- Response includes `has_more: true` if more files available
 
 ### Password Management
 
@@ -449,8 +486,9 @@ livepaste/
 ├── public/
 │   └── index.html         # Built frontend (minified, no comments)
 ├── init.sql               # Database schema
-├── docker-compose.yml     # Postgres + App
+├── docker-compose.yml     # Postgres + App (internal network only)
 ├── Dockerfile             # Multi-stage Node app container
+├── Caddyfile              # Caddy reverse proxy config (reference)
 ├── .github/
 │   └── workflows/
 │       └── deploy.yml     # CI/CD workflow for Hetzner deployment
@@ -630,3 +668,48 @@ curl -X POST http://localhost:8080/api/room/test123/sync/complete \
   -H "Content-Type: application/json" \
   -d '{"session_id":"abc123","finalize":true}'
 ```
+
+## Known Limitations & Remaining Work
+
+### Browser Isolation Detection - Limited Coverage
+
+The isolation detection (Menlo, Zscaler BI, etc.) relies on heuristics that may not catch all isolation environments. False negatives are possible with newer or custom isolation solutions.
+
+### Full CRDT Not Implemented
+
+While basic OT conflict detection is implemented (server returns 409 with conflicting ops), true CRDT or full OT transformation is not implemented. The client is responsible for resolving conflicts when they occur.
+
+## Recently Implemented Features
+
+### Delta Sync - File Deletions (Implemented)
+
+File deletions are now propagated via delta sync:
+- Server tracks deletions in `deleted_files` table with version numbers
+- Delta sync response includes `deleted_path_hashes[]` array
+- Client removes deleted files from local state automatically
+
+### OT Conflict Detection (Implemented)
+
+The ops endpoint now includes conflict detection:
+- Server checks `base_version` against file's current version
+- Returns HTTP 409 with `conflicting_ops[]` when conflicts detected
+- Client receives all conflicting operations to enable resolution
+
+```javascript
+// Conflict response (HTTP 409)
+{
+  "error": "conflict",
+  "current_version": 5,
+  "base_version": 3,
+  "conflicting_ops": [
+    { "seq": 4, "op_encrypted": "...", "client_id": "other-client" }
+  ]
+}
+```
+
+### Response Format Unified (Implemented)
+
+The `/api/workspace/:id/finalize` endpoint now returns both formats:
+- `files[]` - Standard format for consistency
+- `documents[]` - Disguised format for backward compatibility
+- `deleted_path_hashes[]` - For delta sync support
