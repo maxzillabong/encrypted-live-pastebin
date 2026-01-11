@@ -687,12 +687,15 @@ File deletions are now propagated via delta sync:
 - Server tracks deletions in `deleted_files` table with version numbers
 - Delta sync response includes `deleted_path_hashes[]` array
 - Client removes deleted files from local state automatically
+- **Automatic cleanup**: Old deletion records pruned hourly (keeps last 100 versions per room)
 
 ### OT Conflict Detection (Implemented)
 
-The ops endpoint now includes conflict detection:
+The ops endpoint now includes conflict detection with race condition prevention:
+- **Row-level locking**: Uses `SELECT ... FOR UPDATE` on room and file rows
 - Server checks `base_version` against file's current version
 - Returns HTTP 409 with `conflicting_ops[]` when conflicts detected
+- Handles edge case of stale clients with `base_version=0`
 - Client receives all conflicting operations to enable resolution
 
 ```javascript
@@ -713,6 +716,13 @@ The `/api/workspace/:id/finalize` endpoint now returns both formats:
 - `files[]` - Standard format for consistency
 - `documents[]` - Disguised format for backward compatibility
 - `deleted_path_hashes[]` - For delta sync support
+
+### Sync Version Optimization (Implemented)
+
+Room version is only incremented when files are actually deleted during sync:
+- Prevents unnecessary version bumps on no-op finalizations
+- Reduces delta sync noise for clients
+- Applied to all sync endpoints: `/sync`, `/sync/complete`, `/finalize`
 
 ### Traffic Obfuscation Suite (Implemented)
 
