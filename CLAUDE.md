@@ -713,3 +713,14 @@ The `/api/workspace/:id/finalize` endpoint now returns both formats:
 - `files[]` - Standard format for consistency
 - `documents[]` - Disguised format for backward compatibility
 - `deleted_path_hashes[]` - For delta sync support
+
+### Traffic Obfuscation Suite (Implemented)
+
+To evade traffic analysis and anomaly detection, LivePaste now mimics standard SaaS traffic patterns:
+
+1. **Request Padding:** All POST payloads and JSON responses are padded to powers of 2 (256, 512, 1024...) using a `_pad` field filled with random characters. This masks the exact size of the encrypted content.
+2. **Jitter:** Client introduces random 30-150ms delays before API calls to disrupt timing analysis.
+3. **Decoy Headers:** Realistic headers (`X-Feature-Flags`, `X-Client-Version`) are injected to resemble complex SaaS applications.
+4. **Fake Sync:** Background heartbeat requests (`/api/workspace/sync`) occur every 25-45s to mimic "keep-alive" traffic of active collaboration tools.
+5. **Field Stripping:** The server automatically strips decoy fields (`_analytics`, `_meta`, `_pad`) before processing requests.
+

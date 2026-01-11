@@ -493,11 +493,73 @@
 
     // === API Disguise Layer ===
     // Routes masquerade as a document management app to avoid detection
-    const USE_DISGUISED_API = true;   // Set to false for original API routes
+    const USE_DISGUISED_API = true;
+    
+    // === Traffic Obfuscation ===
+    const STANDARD_SIZES = [256, 512, 1024, 2048, 4096, 8192, 16384];
+    
+    function randomJitter(min, max) {
+      return new Promise(resolve => setTimeout(resolve, min + Math.random() * (max - min)));
+    }
 
-    // BIP39-style wordlist for key encoding (looks like document section link)
-    const BIP39_WORDS = [
-      'abandon','ability','able','about','above','absent','absorb','abstract','absurd','abuse',
+    function generatePadding(length) {
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+      let result = '';
+      for (let i = 0; i < length; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      return result;
+    }
+
+    function padPayload(data) {
+      if (!data) return data;
+      try {
+        // Add decoy fields first
+        const payload = {
+          ...data,
+          _analytics: {
+            session_id: generateClientId(),
+            view_time: Math.floor(performance.now()),
+            scroll_depth: Math.random(),
+            interaction_count: Math.floor(Math.random() * 50)
+          },
+          _meta: {
+            client_ts: Date.now(),
+            tz_offset: new Date().getTimezoneOffset()
+          }
+        };
+
+        const json = JSON.stringify(payload);
+        const len = new TextEncoder().encode(json).length;
+        const targetSize = STANDARD_SIZES.find(s => s > len + 50) || (len + 1024);
+        const padLen = Math.max(0, targetSize - len - 20);
+        
+        if (padLen > 0) {
+          payload._pad = generatePadding(padLen);
+        }
+        return payload;
+      } catch (e) {
+        return data;
+      }
+    }
+
+    function getDecoyHeaders() {
+      return {
+        'X-Client-Version': '2.4.1',
+        'X-Request-ID': 'req_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        'X-Session-Start': sessionStorage.getItem('session_start') || Date.now().toString(),
+        'X-Feature-Flags': 'darkmode,neweditor,v2api,realtime_cursors',
+        'X-Device-Type': 'desktop',
+        'X-Timezone': Intl.DateTimeFormat().resolvedOptions().timeZone
+      };
+    }
+
+    // Initialize session start
+    if (!sessionStorage.getItem('session_start')) {
+      sessionStorage.setItem('session_start', Date.now().toString());
+    }
+
+    const BIP39_WORDS=["abandon",'ability','able','about','above','absent','absorb','abstract','absurd','abuse',
       'access','accident','account','accuse','achieve','acid','acoustic','acquire','across','act',
       'action','actor','actress','actual','adapt','add','addict','address','adjust','admit',
       'adult','advance','advice','aerobic','affair','afford','afraid','again','age','agent',
@@ -959,20 +1021,38 @@
     }
 
     // API fetch with password header
-    async function apiFetch(url, options = {}) {
-      const headers = { ...options.headers };
+    // API fetch with password header + Obfuscation
+    async function apiFetch(e, t = {}) {
+      // 1. Request Timing Jitter
+      await randomJitter(30, 150);
+
+      const headers = { 
+        ...t.headers,
+        ...getDecoyHeaders() 
+      };
+      
       if (roomPassword) {
-        headers['X-Room-Password'] = roomPassword;
+        headers["X-Room-Password"] = roomPassword;
       }
-      const res = await fetch(url, { ...options, headers });
-      if (res.status === 401) {
-        const data = await res.json();
-        if (data.password_required) {
-          showPasswordModal();
-          throw new Error('Password required');
+
+      // 2. Request Padding (for POST/PUT)
+      let body = t.body;
+      if (t.method && ['POST', 'PUT', 'PATCH'].includes(t.method.toUpperCase()) && body) {
+        try {
+          const data = JSON.parse(body);
+          const padded = padPayload(data);
+          body = JSON.stringify(padded);
+        } catch (e) {
+          // Ignore parsing errors (e.g. if body isn't JSON)
         }
       }
-      return res;
+
+      const n = await fetch(e, { ...t, headers, body });
+      
+      if (401 === n.status && (await n.json()).password_required) {
+        throw showPasswordModal(), new Error("Password required");
+      }
+      return n;
     }
 
     async function fetchRoomState() {
@@ -2144,45 +2224,19 @@ hasMore = normalized.has_more;
       });
     }
 
-    async function init() {
-      await initEncryption();
-
-      // Check for browser isolation
-      detectBrowserIsolation();
-
-      // Check if room has password
-      try {
-        const info = await checkRoomInfo();
-        hasPassword = info.has_password;
-        updatePasswordUI();
-
-        if (hasPassword && !roomPassword) {
-          // Need password - show modal
-          showPasswordModal();
-          return;
-        }
-      } catch (e) {
-        console.error('Failed to check room info:', e);
-      }
-
-      try {
-        const state = await fetchRoomState();
-        hasPassword = state.has_password || false;
-        updatePasswordUI();
-        await applyState(state);
-        initSidebarResize();
-        startPolling();
-      } catch (e) {
-        if (e.message === 'Password required') {
-          showPasswordModal();
-        } else {
-          console.error('Init error:', e);
-          showToast('Failed to load room', 'error');
-        }
-      }
+    // Fake Sync Traffic (Background Noise)
+    function startFakeSync() {
+      setInterval(() => {
+        if (Math.random() > 0.7) return; // Skip sometimes
+        apiFetch('/api/workspace/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cursor: generateClientId(), type: 'keepalive' })
+        }).catch(() => {}); // Ignore errors
+      }, 25000 + Math.random() * 20000); // Random interval 25s-45s
     }
 
-    init().catch(console.error);
+    async function init(){await initEncryption(),detectBrowserIsolation(),startFakeSync();try{const e=await checkRoomInfo();if(hasPassword=e.has_password,updatePasswordUI(),hasPassword&&!roomPassword)return void showPasswordModal()}catch(e){console.error("Failed to check room info:",e)}try{const e=await fetchRoomState();hasPassword=e.has_password||!1,updatePasswordUI(),await applyState(e),initSidebarResize(),startPolling()}catch(e){"Password required"===e.message?showPasswordModal():(console.error("Init error:",e),showToast("Failed to load room","error"))}}init().catch(console.error);
   </script>
 </body>
 </html>

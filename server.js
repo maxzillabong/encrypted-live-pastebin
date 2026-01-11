@@ -15,6 +15,70 @@ const BCRYPT_ROUNDS = 10;
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
+// === Traffic Obfuscation Utilities ===
+const STANDARD_SIZES = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+
+function generatePadding(length) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
+function padPayload(data) {
+  try {
+    const json = JSON.stringify(data);
+    const len = Buffer.byteLength(json, 'utf8');
+    const targetSize = STANDARD_SIZES.find(s => s > len + 20) || len + 100; // +20 buffer
+    const padLen = Math.max(0, targetSize - len - 10); // -10 for json overhead of _pad field
+    if (padLen > 0) {
+      return { ...data, _pad: generatePadding(padLen) };
+    }
+    return data;
+  } catch (e) {
+    return data;
+  }
+}
+
+// Middleware to strip decoy fields
+app.use((req, res, next) => {
+  if (req.body && typeof req.body === 'object') {
+    delete req.body._pad;
+    delete req.body._analytics;
+    delete req.body._sync;
+    delete req.body._meta;
+  }
+  
+  // Monkey-patch res.json to auto-pad responses
+  const originalJson = res.json;
+  res.json = function (obj) {
+    if (obj && typeof obj === 'object') {
+      // Add fake analytics to response too
+      obj._meta = {
+        server_ts: Date.now(),
+        process_id: crypto.randomUUID().slice(0, 8),
+        region: 'eu-central-1'
+      };
+      const padded = padPayload(obj);
+      return originalJson.call(this, padded);
+    }
+    return originalJson.call(this, obj);
+  };
+  next();
+});
+
+// Fake Sync Endpoint (for cover traffic)
+app.post('/api/workspace/sync', (req, res) => {
+  // Just return success with some fake status
+  res.json({
+    sync_status: 'synced',
+    cursor: req.body.cursor || '0',
+    server_time: new Date().toISOString()
+  });
+});
+
 // Database connection
 const DATABASE_URL = process.env.DATABASE_URL || 'postgres://livepaste:livepaste@localhost:5432/livepaste';
 const pool = new Pool({ connectionString: DATABASE_URL });
