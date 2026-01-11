@@ -1,0 +1,75 @@
+(security_headers) {
+  header {
+    Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+    Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com; connect-src 'self' wss: https:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; worker-src 'blob'"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "DENY"
+    X-XSS-Protection "1; mode=block"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=()"
+    -Server
+  }
+}
+
+# tools.maxzilla.nl - API with secret header
+tools.maxzilla.nl {
+  handle /crush* {
+    uri strip_prefix /crush
+    reverse_proxy 172.18.0.1:3001
+  }
+  handle /v1/* {
+    @valid_key header X-Energy-Key 79701c50993b4528dcdd748f5022874c82b1f459555331974bd1daf09da9fa2e
+    handle @valid_key {
+      reverse_proxy 172.18.0.1:42069
+    }
+    respond "Unauthorized" 403
+  }
+  handle {
+    root * /var/www/tools.maxzilla.nl
+    file_server browse
+  }
+}
+
+# PNGCrush Pro - image optimizer
+pngcrush.maxzilla.nl {
+  reverse_proxy 172.18.0.1:3001
+}
+
+# Coolify - platform.maxzilla.nl
+platform.maxzilla.nl {
+  reverse_proxy 172.18.0.1:8000
+}
+
+# SnappyMail - comms.maxzilla.nl
+comms.maxzilla.nl {
+  reverse_proxy 172.18.0.1:9080
+}
+
+# Keycloak - login.maxzilla.nl
+login.maxzilla.nl {
+  reverse_proxy 172.18.0.1:8180
+}
+
+# Hermes - encrypted file sharing (Deprecated/Stopped, but keeping config for now or remove?)
+# hermes.maxzilla.nl {
+#   reverse_proxy 172.18.0.1:3000
+# }
+
+# LivePaste - E2E encrypted collaborative code sharing
+livecollab.maxzilla.nl {
+  import security_headers
+  reverse_proxy livepaste-app-1:8080
+}
+
+# Vibescape root - Coming Soon
+vibescape.nl, www.vibescape.nl {
+  import security_headers
+  root * /var/www/vibescape.nl
+  file_server
+}
+
+# LiveCollab - E2E encrypted collaborative code sharing (vibescape)
+collab.vibescape.nl {
+  import security_headers
+  reverse_proxy livepaste-app-1:8080
+}

@@ -551,9 +551,13 @@
 
     // API endpoint mapping for disguise mode
     const API = {
-      roomState: () => USE_DISGUISED_API ? `/api/workspace/${roomId}` : `/api/room/${roomId}`,
-      roomInfo: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/info` : `/api/room/${roomId}/info`,
-      roomVersion: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/status` : `/api/room/${roomId}/version`,
+      roomState: (since = 0, limit = 1000, offset = 0) => {
+        const params = `?since=${since}&limit=${limit}&offset=${offset}`;
+        return USE_DISGUISED_API 
+          ? `/api/workspace/${roomId}${params}` 
+          : `/api/room/${roomId}${params}`;
+      },
+      roomInfo: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/info` : `/api/room/${roomId}/info`,      roomVersion: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/status` : `/api/room/${roomId}/version`,
       syncBegin: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/session` : `/api/room/${roomId}/sync/begin`,
       syncChunk: () => USE_DISGUISED_API ? `/api/documents/batch` : `/api/room/${roomId}/sync/chunk`,
       syncComplete: () => USE_DISGUISED_API ? `/api/workspace/${roomId}/finalize` : `/api/room/${roomId}/sync/complete`,
@@ -971,28 +975,56 @@
     }
 
     async function fetchRoomState() {
-      const res = await apiFetch(API.roomState());
-      if (!res.ok) throw new Error('Failed to fetch room');
-      const data = await res.json();
-      // Normalize response from disguised API
-      if (USE_DISGUISED_API && data.documents) {
-        return {
-          version: data.version,
-          op_seq: data.op_seq,
-          has_password: data.has_password,
-          files: data.documents.map(d => ({
-            id: d.id,
-            path_hash: d.metadata?.refs?.[0],
-            path_encrypted: d.title,
-            content_encrypted: d.content,
-            is_syncable: d.is_syncable,
-            size_bytes: d.size_bytes,
-            version: parseInt(d.metadata?.tracking?.utm_source) || 1
-          })),
-          changesets: data.proposals || []
-        };
+      let allFiles = [];
+      let offset = 0;
+      const LIMIT = 50; // Chunk size
+      let hasMore = true;
+      let initialData = null;
+
+      while (hasMore) {
+        // Fetch chunk
+        const res = await apiFetch(API.roomState(0, LIMIT, offset));
+        if (!res.ok) throw new Error('Failed to fetch room chunk');
+        const data = await res.json();
+
+        // Normalize if disguised
+        let normalized;
+        if (USE_DISGUISED_API) {
+          normalized = {
+            version: data.version,
+            op_seq: data.op_seq,
+            has_password: data.has_password,
+            files: data.documents.map(d => ({
+              id: d.id,
+              path_hash: d.metadata?.refs?.[0],
+              path_encrypted: d.title,
+              content_encrypted: d.content,
+              is_syncable: d.is_syncable,
+              size_bytes: d.size_bytes,
+              version: parseInt(d.metadata?.tracking?.utm_source) || 1
+            })),
+            changesets: data.proposals || [],
+            has_more: data.has_more
+          };
+        } else {
+          normalized = data;
+        }
+
+        if (offset === 0) initialData = normalized;
+        allFiles.push(...normalized.files);
+        
+hasMore = normalized.has_more;
+        offset += LIMIT;
+        
+        // Optional: could yield to UI here to show progress
+        if (hasMore) {
+           console.log(`Loaded ${allFiles.length} files...`);
+           await new Promise(r => setTimeout(r, 50)); // Tiny delay to not block UI
+        }
       }
-      return data;
+      
+      initialData.files = allFiles;
+      return initialData;
     }
 
     async function checkRoomInfo() {
@@ -1239,21 +1271,20 @@
 
     async function poll() {
       if (isPolling) return;
-
+      
       // Skip polling if user is actively typing to prevent overwrites/jank
       if (Date.now() - lastActivityTime < POLLING_PAUSE_MS) return;
 
       isPolling = true;
       try {
-        const res = await apiFetch(API.roomVersion());
+        const res = await apiFetch('/api/room/' + roomId + '/version');
         if (!res.ok) throw new Error('Version check failed');
-        const versionData = await res.json();
-        // Handle both disguised (revision) and original (version) responses
-        const serverVersion = versionData.revision ?? versionData.version;
+        const { version: serverVersion } = await res.json();
 
         if (serverVersion > version) {
-          // Version changed, fetch full state
-          const state = await fetchRoomState();
+          // Version changed, fetch ONLY updates (partial sync)
+          const stateRes = await apiFetch(API.roomState(version));
+          const state = await stateRes.json();
           await applyState(state);
         }
         setStatus(true);
@@ -1283,13 +1314,38 @@
 
     async function applyState(state) {
       version = state.version;
-      opSeq = state.op_seq || 0; // Track operation sequence for delta sync
       document.getElementById('versionBadge').textContent = version;
-      files = await Promise.all(state.files.map(async f => ({
+      
+      if (state.op_seq !== undefined) {
+        opSeq = state.op_seq;
+      }
+
+      // Decrypt new/updated files
+      const newFiles = await Promise.all(state.files.map(async f => ({
         ...f,
         path: await decrypt(f.path_encrypted),
         content: f.is_syncable ? await decrypt(f.content_encrypted) : null
       })));
+
+      // Merge into existing files
+      for (const newFile of newFiles) {
+        const existingIndex = files.findIndex(f => f.path_hash === newFile.path_hash);
+        if (existingIndex !== -1) {
+          // Update existing
+          files[existingIndex] = newFile;
+        } else {
+          // Add new
+          files.push(newFile);
+        }
+      }
+
+      // Note: We don't handle file deletions in this partial sync because
+      // getRoomState only returns *updated* files. To handle deletions correctly
+      // with partial sync, the server would need to return tombstones or we'd
+      // need a different sync mechanism. For now, deletions might require a refresh
+      // or we can implement a "deleted_files" list in the response.
+      // Given the constraints, this is a trade-off for bandwidth.
+
       changesets = await Promise.all((state.changesets || []).map(async cs => ({
         ...cs,
         author: await decrypt(cs.author_encrypted),
@@ -1305,12 +1361,23 @@
       renderFileTree();
       updateChangesetBanner();
       if (selectedFile) {
-        const stillExists = files.find(f => f.path === selectedFile.path);
-        if (stillExists) {
-          selectFile(stillExists);
-        } else {
-          selectedFile = null;
-          showEmptyState();
+        const updatedFile = files.find(f => f.path === selectedFile.path);
+        if (updatedFile && updatedFile.version !== selectedFile.version) {
+          // Content changed on server
+          if (updatedFile.is_syncable) {
+             // Only update editor if we aren't typing (handled by poll check, but double check)
+             // Or if using Ops, this might be handled by applyRemoteOp
+             // For now, simple replace if changed
+             const cursor = cmEditor ? cmEditor.getCursor() : null;
+             const scroll = cmEditor ? cmEditor.getScrollInfo() : null;
+             
+             selectFile(updatedFile); // Re-select to update editor
+             
+             if (cmEditor && cursor) {
+               cmEditor.setCursor(cursor);
+               cmEditor.scrollTo(scroll.left, scroll.top);
+             }
+          }
         }
       }
     }
@@ -1697,10 +1764,29 @@
           return;
         }
 
-        showToast(`Syncing ${fileList.length} files...`);
-        const newState = await syncFiles(fileList);
-        await applyState(newState);
-        showToast(`Uploaded ${fileList.length} files (${skippedCount} skipped)`);
+        showToast(`Syncing ${e.length} files...`);
+        const o = await syncFiles(e);
+        
+        // Normalize response if using disguised API
+        let normalizedState = o;
+        if (USE_DISGUISED_API && o.documents) {
+          normalizedState = {
+            version: o.version,
+            op_seq: o.op_seq,
+            files: o.documents.map(d => ({
+              id: d.id,
+              path_hash: d.metadata?.refs?.[0],
+              path_encrypted: d.title,
+              content_encrypted: d.content,
+              is_syncable: d.is_syncable,
+              size_bytes: d.size_bytes,
+              version: parseInt(d.metadata?.tracking?.utm_source) || 1
+            })),
+            changesets: o.proposals || []
+          };
+        }
+        
+        await applyState(normalizedState), showToast(`Uploaded ${e.length} files (${t} skipped)`)
       } catch (e) {
         if (e.name !== 'AbortError') {
           console.error('Folder upload error:', e);

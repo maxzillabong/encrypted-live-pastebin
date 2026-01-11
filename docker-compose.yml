@@ -9,24 +9,31 @@ services:
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U livepaste"]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - default
 
   app:
     build: .
     environment:
       DATABASE_URL: postgres://livepaste:livepaste@postgres:5432/livepaste
       PORT: 8080
-      RETENTION_HOURS: 24  # Room retention in hours (1-120, default 24)
-    ports:
-      - "8080:8080"
+      RETENTION_HOURS: 24
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - default
+      - root_default
 
 volumes:
   postgres_data:
+
+networks:
+  root_default:
+    external: true

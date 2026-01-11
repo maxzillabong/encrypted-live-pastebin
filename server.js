@@ -113,7 +113,7 @@ function requireRoomPassword(req, res, next) {
 }
 
 // Get room state
-async function getRoomState(roomId) {
+async function getRoomState(roomId, sinceVersion = 0, limit = 1000, offset = 0) {
   const roomResult = await pool.query(
     'SELECT version, op_seq FROM rooms WHERE id = $1',
     [roomId]
@@ -122,8 +122,8 @@ async function getRoomState(roomId) {
   const opSeq = roomResult.rows[0]?.op_seq || 0;
 
   const filesResult = await pool.query(
-    'SELECT id, path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes, version, snapshot_seq FROM files WHERE room_id = $1 ORDER BY path_encrypted',
-    [roomId]
+    'SELECT id, path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes, version, snapshot_seq FROM files WHERE room_id = $1 AND version > $2 ORDER BY path_encrypted LIMIT $3 OFFSET $4',
+    [roomId, sinceVersion, limit, offset]
   );
 
   const changesetsResult = await pool.query(
@@ -135,6 +135,7 @@ async function getRoomState(roomId) {
     version,
     op_seq: opSeq,
     files: filesResult.rows,
+    has_more: filesResult.rows.length === limit,
     changesets: changesetsResult.rows.map(cs => ({
       ...cs,
       changes: cs.changes || []
@@ -151,7 +152,11 @@ async function getRoomState(roomId) {
 app.get('/api/workspace/:id', requireRoomPassword, async (req, res) => {
   try {
     await ensureRoom(req.params.id);
-    const state = await getRoomState(req.params.id);
+    const since = parseInt(req.query.since, 10) || 0;
+    const limit = parseInt(req.query.limit, 10) || 1000;
+    const offset = parseInt(req.query.offset, 10) || 0;
+    
+    const state = await getRoomState(req.params.id, since, limit, offset);
     const info = await getRoomInfo(req.params.id);
     // Wrap in document-like response
     res.json({
@@ -170,6 +175,7 @@ app.get('/api/workspace/:id', requireRoomPassword, async (req, res) => {
       })),
       version: state.version,
       op_seq: state.op_seq,
+      has_more: state.has_more,
       has_password: info.has_password,
       proposals: state.changesets
     });
@@ -409,10 +415,26 @@ app.post('/api/workspace/:id/finalize', requireRoomPassword, async (req, res) =>
 
     syncSessions.delete(sessionKey);
     const state = await getRoomState(roomId);
+    
+    // Return full state so client can update UI immediately
     res.json({
       status: 'complete',
-      documents_synced: session.pathHashes.size,
-      workspace_revision: state.version
+      workspace_id: roomId,
+      documents: state.files.map(f => ({
+        id: f.id,
+        title: f.path_encrypted,
+        content: f.content_encrypted,
+        metadata: {
+          refs: [f.path_hash],
+          tracking: { utm_source: f.version?.toString() || '1' }
+        },
+        is_syncable: f.is_syncable,
+        size_bytes: f.size_bytes,
+        updated_at: f.updated_at
+      })),
+      version: state.version,
+      op_seq: state.op_seq,
+      documents_synced: session.pathHashes.size
     });
   } catch (err) {
     console.error('[API] Finalize error:', err);
@@ -511,7 +533,11 @@ app.post('/api/room/:id/verify-password', async (req, res) => {
 app.get('/api/room/:id', requireRoomPassword, async (req, res) => {
   try {
     await ensureRoom(req.params.id);
-    const state = await getRoomState(req.params.id);
+    const since = parseInt(req.query.since, 10) || 0;
+    const limit = parseInt(req.query.limit, 10) || 1000;
+    const offset = parseInt(req.query.offset, 10) || 0;
+
+    const state = await getRoomState(req.params.id, since, limit, offset);
     const info = await getRoomInfo(req.params.id);
     res.json({ ...state, has_password: info.has_password });
   } catch (err) {
