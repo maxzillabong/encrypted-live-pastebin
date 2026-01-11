@@ -724,3 +724,27 @@ To evade traffic analysis and anomaly detection, LivePaste now mimics standard S
 4. **Fake Sync:** Background heartbeat requests (`/api/workspace/sync`) occur every 25-45s to mimic "keep-alive" traffic of active collaboration tools.
 5. **Field Stripping:** The server automatically strips decoy fields (`_analytics`, `_meta`, `_pad`) before processing requests.
 
+### Streaming Upload (Implemented)
+
+Folder uploads now use streaming to minimize memory usage for large codebases:
+
+**Before (accumulated):**
+```
+Scan all files → fileList[] (plaintext) → encrypted[] → chunks[] → upload
+Peak memory: ~2x total file content size
+```
+
+**After (streaming):**
+```
+Scan batch → encrypt batch → upload → release memory → next batch
+Peak memory: ~(batch_size × avg_file_size) ≈ 200KB-2MB
+```
+
+Key improvements:
+1. **Async generators** - `streamingScan()` yields file batches as they're discovered
+2. **Immediate upload** - Each batch is encrypted and uploaded before loading next
+3. **Early GC** - Plaintext content nulled immediately after encryption
+4. **Configurable batch size** - `SCAN_BATCH_SIZE = 20` files per batch
+
+This reduces memory usage from O(n) to O(1) relative to codebase size, enabling upload of large Java/enterprise monorepos without browser memory issues.
+
