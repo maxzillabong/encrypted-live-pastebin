@@ -226,14 +226,6 @@ async function trackDeletion(client, roomId, pathHash, version) {
   );
 }
 
-// Clean up old deletion records (called during room cleanup)
-async function cleanupDeletions(roomId, keepAfterVersion) {
-  await pool.query(
-    'DELETE FROM deleted_files WHERE room_id = $1 AND deleted_at_version < $2',
-    [roomId, keepAfterVersion]
-  );
-}
-
 // === API Routes ===
 
 // === Disguised Routes (masquerade as document management app) ===
@@ -492,15 +484,18 @@ app.post('/api/workspace/:id/finalize', requireRoomPassword, async (req, res) =>
       await client.query('BEGIN');
       const existingResult = await client.query('SELECT id, path_hash FROM files WHERE room_id = $1', [roomId]);
 
-      // Get version for tracking deletions
-      const versionResult = await client.query(
-        'UPDATE rooms SET version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING version',
-        [roomId]
-      );
-      const newVersion = versionResult.rows[0].version;
+      // Find files to delete
+      const filesToDelete = existingResult.rows.filter(row => !session.pathHashes.has(row.path_hash));
 
-      for (const row of existingResult.rows) {
-        if (!session.pathHashes.has(row.path_hash)) {
+      // Only increment version and track deletions if files were actually deleted
+      if (filesToDelete.length > 0) {
+        const versionResult = await client.query(
+          'UPDATE rooms SET version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING version',
+          [roomId]
+        );
+        const newVersion = versionResult.rows[0].version;
+
+        for (const row of filesToDelete) {
           await client.query('DELETE FROM files WHERE id = $1', [row.id]);
           // Track deletion for delta sync
           await trackDeletion(client, roomId, row.path_hash, newVersion);
@@ -843,31 +838,33 @@ app.post('/api/room/:id/sync/complete', requireRoomPassword, async (req, res) =>
     return res.status(400).json({ error: 'Invalid or expired sync session' });
   }
 
+  let deletedCount = 0;
   try {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      // Delete files not in the sync session
+      // Find files not in the sync session
       const existingResult = await client.query(
         'SELECT id, path_hash FROM files WHERE room_id = $1',
         [roomId]
       );
 
-      // Get current version for tracking deletions
-      const versionResult = await client.query(
-        'UPDATE rooms SET version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING version',
-        [roomId]
-      );
-      const newVersion = versionResult.rows[0].version;
+      const filesToDelete = existingResult.rows.filter(row => !session.pathHashes.has(row.path_hash));
+      deletedCount = filesToDelete.length;
 
-      let deletedCount = 0;
-      for (const row of existingResult.rows) {
-        if (!session.pathHashes.has(row.path_hash)) {
+      // Only increment version and track deletions if files were actually deleted
+      if (filesToDelete.length > 0) {
+        const versionResult = await client.query(
+          'UPDATE rooms SET version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING version',
+          [roomId]
+        );
+        const newVersion = versionResult.rows[0].version;
+
+        for (const row of filesToDelete) {
           await client.query('DELETE FROM files WHERE id = $1', [row.id]);
           // Track deletion for delta sync
           await trackDeletion(client, roomId, row.path_hash, newVersion);
-          deletedCount++;
         }
       }
 
@@ -887,6 +884,7 @@ app.post('/api/room/:id/sync/complete', requireRoomPassword, async (req, res) =>
       ...state,
       sync_complete: true,
       files_synced: session.pathHashes.size,
+      files_deleted: deletedCount,
       server_timestamp: new Date().toISOString()
     });
   } catch (err) {
@@ -916,15 +914,18 @@ app.post('/api/room/:id/sync', requireRoomPassword, async (req, res) => {
       const existingPaths = new Map(existingResult.rows.map(r => [r.path_hash, r.id]));
       const newPaths = new Set(files.map(f => f.path_hash));
 
-      // Get version for tracking deletions
-      const versionResult = await client.query(
-        'UPDATE rooms SET version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING version',
-        [roomId]
-      );
-      const newVersion = versionResult.rows[0].version;
+      // Find files to delete
+      const pathsToDelete = [...existingPaths.entries()].filter(([pathHash]) => !newPaths.has(pathHash));
 
-      for (const [pathHash, id] of existingPaths) {
-        if (!newPaths.has(pathHash)) {
+      // Only increment version and track deletions if files were actually deleted
+      if (pathsToDelete.length > 0) {
+        const versionResult = await client.query(
+          'UPDATE rooms SET version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING version',
+          [roomId]
+        );
+        const newVersion = versionResult.rows[0].version;
+
+        for (const [pathHash, id] of pathsToDelete) {
           await client.query('DELETE FROM files WHERE id = $1', [id]);
           // Track deletion for delta sync
           await trackDeletion(client, roomId, pathHash, newVersion);
@@ -1141,17 +1142,22 @@ app.post('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
     try {
       await client.query('BEGIN');
 
+      // Lock the room row to prevent concurrent operations from racing
+      await client.query('SELECT id FROM rooms WHERE id = $1 FOR UPDATE', [roomId]);
+
       // Check for OT conflicts: get file's current version and pending ops
+      // Use FOR UPDATE to lock the file row and prevent race conditions
       const fileResult = await client.query(
-        'SELECT version, snapshot_seq FROM files WHERE room_id = $1 AND path_hash = $2',
+        'SELECT version, snapshot_seq FROM files WHERE room_id = $1 AND path_hash = $2 FOR UPDATE',
         [roomId, file_path_hash]
       );
 
       const currentFileVersion = fileResult.rows[0]?.version || 0;
       const snapshotSeq = fileResult.rows[0]?.snapshot_seq || 0;
 
-      // If base_version is provided and doesn't match current version, check for conflicts
-      if (base_version !== undefined && base_version > 0) {
+      // If base_version is provided, check for conflicts
+      // Also check when file exists but client has base_version=0 (stale client)
+      if (base_version !== undefined && (base_version > 0 || currentFileVersion > 0)) {
         // Get operations that happened since the client's base version
         const conflictOpsResult = await client.query(
           'SELECT seq, op_encrypted, client_id FROM operations WHERE room_id = $1 AND file_path_hash = $2 AND seq > $3 ORDER BY seq ASC',
@@ -1161,7 +1167,7 @@ app.post('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
         // Filter out own client's ops
         const conflictingOps = conflictOpsResult.rows.filter(op => op.client_id !== client_id);
 
-        // If there are conflicting ops from other clients, return conflict info
+        // If there are conflicting ops from other clients and client is behind, return conflict
         if (conflictingOps.length > 0 && base_version < currentFileVersion) {
           await client.query('ROLLBACK');
           return res.status(409).json({
@@ -1307,12 +1313,27 @@ app.delete('/api/room/:id', requireRoomPassword, async (req, res) => {
 });
 
 // === Cleanup ===
+const DELETION_HISTORY_VERSIONS = 100; // Keep deletion records for last N versions per room
+
 async function runCleanup() {
   try {
+    // Clean up expired rooms
     const result = await pool.query('SELECT cleanup_old_rooms($1) as deleted', [RETENTION_HOURS]);
     const deleted = result.rows[0]?.deleted || 0;
     if (deleted > 0) {
       console.log(`[Cleanup] Deleted ${deleted} room(s) older than ${RETENTION_HOURS}h`);
+    }
+
+    // Clean up old deletion records for active rooms (prevent unbounded growth)
+    const cleanupResult = await pool.query(`
+      DELETE FROM deleted_files df
+      WHERE df.deleted_at_version < (
+        SELECT r.version - $1 FROM rooms r WHERE r.id = df.room_id
+      )
+    `, [DELETION_HISTORY_VERSIONS]);
+
+    if (cleanupResult.rowCount > 0) {
+      console.log(`[Cleanup] Pruned ${cleanupResult.rowCount} old deletion record(s)`);
     }
   } catch (err) {
     console.error('[Cleanup] Error:', err.message);

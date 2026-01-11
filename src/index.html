@@ -1204,59 +1204,82 @@ hasMore = normalized.has_more;
       return clientId;
     }
 
-    async function syncFiles(fileList) {
-      // Encrypt all files first (CPU-bound, do in batches)
-      const ENCRYPT_BATCH_SIZE = 30;
-      const encrypted = [];
-
-      for (let i = 0; i < fileList.length; i += ENCRYPT_BATCH_SIZE) {
-        const batch = fileList.slice(i, i + ENCRYPT_BATCH_SIZE);
-        const batchEncrypted = await Promise.all(batch.map(async f => ({
+    // Encrypt a batch of files and release plaintext immediately
+    async function encryptBatch(batch) {
+      const encrypted = await Promise.all(batch.map(async f => {
+        const result = {
           path_hash: await hashPath(f.path),
           path_encrypted: await encrypt(f.path),
           content_encrypted: f.is_syncable ? await encrypt(f.content) : null,
           is_syncable: f.is_syncable,
           size_bytes: f.is_syncable ? null : f.size
-        })));
-        encrypted.push(...batchEncrypted);
-        console.log(`Encrypted ${Math.min(i + ENCRYPT_BATCH_SIZE, fileList.length)}/${fileList.length} files`);
+        };
+        // Release plaintext content immediately after encryption
+        f.content = null;
+        return result;
+      }));
+      return encrypted;
+    }
+
+    // Upload a single chunk to the server
+    async function uploadChunk(sessionId, chunkIndex, files) {
+      let chunkBody;
+      if (USE_DISGUISED_API) {
+        chunkBody = {
+          workspace_id: roomId,
+          session_token: sessionId,
+          batch_index: chunkIndex,
+          documents: files.map(f => ({
+            id: f.path_hash,
+            title: f.path_encrypted,
+            content: f.content_encrypted,
+            metadata: {
+              refs: [f.path_hash],
+              tracking: { utm_source: 'sync', utm_campaign: generateRequestId() }
+            },
+            is_syncable: f.is_syncable,
+            size_bytes: f.size_bytes
+          }))
+        };
+      } else {
+        chunkBody = {
+          session_id: sessionId,
+          chunk_index: chunkIndex,
+          files: files,
+          client_timestamp: new Date().toISOString(),
+          request_id: generateRequestId(),
+          metadata: generateMetadata()
+        };
       }
 
-      // Calculate chunk sizes based on payload size, not file count
-      const chunks = [];
-      let currentChunk = [];
-      let currentSize = 0;
+      const chunkRes = await apiFetch(API.syncChunk(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(chunkBody)
+      });
 
-      for (const file of encrypted) {
-        const fileSize = JSON.stringify(file).length;
-        if (currentSize + fileSize > CHUNK_TARGET_SIZE && currentChunk.length > 0) {
-          chunks.push(currentChunk);
-          currentChunk = [];
-          currentSize = 0;
-        }
-        currentChunk.push(file);
-        currentSize += fileSize;
-      }
-      if (currentChunk.length > 0) {
-        chunks.push(currentChunk);
-      }
+      if (!chunkRes.ok) throw new Error(`Failed to upload chunk ${chunkIndex + 1}`);
+      return chunkRes.json();
+    }
 
-      console.log(`Split into ${chunks.length} chunks for upload`);
-
-      // Start sync session
+    // Streaming sync: processes files as they're discovered, minimizing memory usage
+    // Takes an async generator that yields file batches
+    async function streamingSyncFiles(fileIterator, onProgress) {
       const clientId = generateClientId();
+
+      // Start sync session (streaming mode - counts are estimates)
       let beginBody;
       if (USE_DISGUISED_API) {
         beginBody = {
           client_id: clientId,
-          batch_count: chunks.length,
-          document_count: encrypted.length
+          batch_count: -1,  // Unknown, streaming mode
+          document_count: -1
         };
       } else {
         beginBody = {
           client_id: clientId,
-          total_chunks: chunks.length,
-          total_files: encrypted.length,
+          total_chunks: -1,  // Unknown, streaming mode
+          total_files: -1,
           metadata: generateMetadata()
         };
       }
@@ -1271,54 +1294,49 @@ hasMore = normalized.has_more;
       const beginData = await beginRes.json();
       const sessionId = USE_DISGUISED_API ? beginData.session_token : beginData.session_id;
 
-      // Upload chunks with random delays
-      for (let i = 0; i < chunks.length; i++) {
-        if (i > 0) {
-          // Random delay between chunks to mimic human behavior
+      let chunkIndex = 0;
+      let totalFiles = 0;
+      let currentChunk = [];
+      let currentChunkSize = 0;
+
+      // Process files as they come from the iterator
+      for await (const fileBatch of fileIterator) {
+        // Encrypt this batch immediately
+        const encryptedBatch = await encryptBatch(fileBatch);
+
+        for (const file of encryptedBatch) {
+          const fileSize = JSON.stringify(file).length;
+
+          // If adding this file would exceed chunk size, upload current chunk first
+          if (currentChunkSize + fileSize > CHUNK_TARGET_SIZE && currentChunk.length > 0) {
+            if (chunkIndex > 0) {
+              await new Promise(r => setTimeout(r, randomDelay()));
+            }
+            await uploadChunk(sessionId, chunkIndex, currentChunk);
+            chunkIndex++;
+            if (onProgress) onProgress({ chunksUploaded: chunkIndex, filesProcessed: totalFiles });
+
+            // Release chunk memory
+            currentChunk = [];
+            currentChunkSize = 0;
+          }
+
+          currentChunk.push(file);
+          currentChunkSize += fileSize;
+          totalFiles++;
+        }
+
+        // Update progress after each batch
+        if (onProgress) onProgress({ chunksUploaded: chunkIndex, filesProcessed: totalFiles });
+      }
+
+      // Upload remaining files in the last chunk
+      if (currentChunk.length > 0) {
+        if (chunkIndex > 0) {
           await new Promise(r => setTimeout(r, randomDelay()));
         }
-
-        let chunkBody;
-        if (USE_DISGUISED_API) {
-          // Transform files to document format
-          chunkBody = {
-            workspace_id: roomId,
-            session_token: sessionId,
-            batch_index: i,
-            documents: chunks[i].map(f => ({
-              id: f.path_hash,
-              title: f.path_encrypted,
-              content: f.content_encrypted,
-              metadata: {
-                refs: [f.path_hash],
-                tracking: { utm_source: 'sync', utm_campaign: generateRequestId() }
-              },
-              is_syncable: f.is_syncable,
-              size_bytes: f.size_bytes
-            }))
-          };
-        } else {
-          chunkBody = {
-            session_id: sessionId,
-            chunk_index: i,
-            files: chunks[i],
-            client_timestamp: new Date().toISOString(),
-            request_id: generateRequestId(),
-            metadata: generateMetadata()
-          };
-        }
-
-        const chunkRes = await apiFetch(API.syncChunk(), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(chunkBody)
-        });
-
-        if (!chunkRes.ok) throw new Error(`Failed to upload chunk ${i + 1}/${chunks.length}`);
-
-        const progress = Math.round(((i + 1) / chunks.length) * 100);
-        console.log(`Uploaded chunk ${i + 1}/${chunks.length} (${progress}%)`);
-        showToast(`Syncing... ${progress}%`);
+        await uploadChunk(sessionId, chunkIndex, currentChunk);
+        chunkIndex++;
       }
 
       // Small delay before completing
@@ -1331,7 +1349,7 @@ hasMore = normalized.has_more;
       } else {
         completeBody = {
           session_id: sessionId,
-          client_checksum: encrypted.length.toString(),
+          client_checksum: totalFiles.toString(),
           finalize: true,
           metadata: generateMetadata()
         };
@@ -1344,7 +1362,25 @@ hasMore = normalized.has_more;
       });
 
       if (!completeRes.ok) throw new Error('Failed to complete sync');
+
+      console.log(`Streaming sync complete: ${totalFiles} files in ${chunkIndex} chunks`);
       return completeRes.json();
+    }
+
+    // Legacy sync for small file lists (non-streaming)
+    async function syncFiles(fileList) {
+      // For small uploads, use simple batch approach
+      async function* batchIterator() {
+        const BATCH_SIZE = 30;
+        for (let i = 0; i < fileList.length; i += BATCH_SIZE) {
+          yield fileList.slice(i, i + BATCH_SIZE);
+        }
+      }
+
+      return streamingSyncFiles(batchIterator(), ({ filesProcessed }) => {
+        const progress = Math.round((filesProcessed / fileList.length) * 100);
+        showToast(`Syncing... ${progress}%`);
+      });
     }
 
     // Short polling - check version every 2 seconds
@@ -1821,45 +1857,73 @@ hasMore = normalized.has_more;
           console.log('No .gitignore found, continuing without it');
         }
 
-        const fileList = [];
+        // Streaming scan: yields batches of files as they're discovered
+        // This prevents loading all file contents into memory at once
+        const SCAN_BATCH_SIZE = 20; // Files per batch
         let skippedCount = 0;
-        async function readDir(handle, path = '') {
-          for await (const entry of handle.values()) {
-            const entryPath = path ? path + '/' + entry.name : entry.name;
-            try {
-              if (entry.kind === 'directory') {
-                if (!NEVER_SYNC_DIRS.has(entry.name) && !isGitignored(entryPath + '/')) {
-                  await readDir(entry, entryPath);
+        let totalFiles = 0;
+
+        async function* streamingScan(handle, path = '') {
+          let batch = [];
+
+          async function* scanDir(dirHandle, dirPath) {
+            for await (const entry of dirHandle.values()) {
+              const entryPath = dirPath ? dirPath + '/' + entry.name : entry.name;
+              try {
+                if (entry.kind === 'directory') {
+                  if (!NEVER_SYNC_DIRS.has(entry.name) && !isGitignored(entryPath + '/')) {
+                    // Recursively yield from subdirectory
+                    yield* scanDir(entry, entryPath);
+                  } else {
+                    skippedCount++;
+                  }
                 } else {
-                  skippedCount++;
+                  const syncable = isSyncable(entryPath, null);
+                  if (syncable) {
+                    const file = await entry.getFile();
+                    const content = await file.text();
+                    batch.push({ path: entryPath, content, is_syncable: true });
+                    totalFiles++;
+
+                    // Yield batch when full
+                    if (batch.length >= SCAN_BATCH_SIZE) {
+                      yield batch;
+                      batch = []; // Release reference for GC
+                    }
+                  } else {
+                    skippedCount++;
+                  }
                 }
-              } else {
-                const syncable = isSyncable(entryPath, null);
-                if (syncable) {
-                  const file = await entry.getFile();
-                  const content = await file.text();
-                  fileList.push({ path: entryPath, content, is_syncable: true });
-                } else {
-                  skippedCount++;
-                }
+              } catch (fileErr) {
+                console.warn(`Skipping ${entryPath}: ${fileErr.message}`);
+                skippedCount++;
               }
-            } catch (fileErr) {
-              console.warn(`Skipping ${entryPath}: ${fileErr.message}`);
-              skippedCount++;
             }
           }
-        }
-        console.log('Starting folder scan...');
-        await readDir(dirHandle);
-        console.log(`Scan complete: ${fileList.length} files to upload, ${skippedCount} skipped`);
 
-        if (fileList.length === 0) {
+          // Yield all files from recursive scan
+          yield* scanDir(handle, path);
+
+          // Yield remaining files in last batch
+          if (batch.length > 0) {
+            yield batch;
+          }
+        }
+
+        console.log('Starting streaming folder upload...');
+        showToast('Scanning and uploading...');
+
+        const syncResult = await streamingSyncFiles(
+          streamingScan(dirHandle),
+          ({ filesProcessed, chunksUploaded }) => {
+            showToast(`Uploading... ${filesProcessed} files (${chunksUploaded} chunks)`);
+          }
+        );
+
+        if (totalFiles === 0) {
           showToast('No syncable files found', 'error');
           return;
         }
-
-        showToast(`Syncing ${fileList.length} files...`);
-        const syncResult = await syncFiles(fileList);
 
         // Normalize response if using disguised API
         let normalizedState = syncResult;
@@ -1881,7 +1945,8 @@ hasMore = normalized.has_more;
         }
 
         await applyState(normalizedState);
-        showToast(`Uploaded ${fileList.length} files (${skippedCount} skipped)`);
+        console.log(`Streaming upload complete: ${totalFiles} files, ${skippedCount} skipped`);
+        showToast(`Uploaded ${totalFiles} files (${skippedCount} skipped)`);
       } catch (e) {
         if (e.name !== 'AbortError') {
           console.error('Folder upload error:', e);
@@ -1893,21 +1958,48 @@ hasMore = normalized.has_more;
     async function handleFolderUpload(event) {
       const inputFiles = event.target.files;
       if (!inputFiles.length) return;
-      const fileList = [];
-      for (const file of inputFiles) {
-        const path = file.webkitRelativePath || file.name;
-        if (isInIgnoredDir(path)) continue;
-        const syncable = isSyncable(path, null);
-        if (syncable) {
-          const content = await file.text();
-          fileList.push({ path, content, is_syncable: true });
-        } else {
-          fileList.push({ path, content: '', is_syncable: false, size: file.size });
+
+      // Streaming upload for fallback file input
+      const BATCH_SIZE = 20;
+      let totalFiles = 0;
+      let skippedCount = 0;
+
+      async function* streamingFileInput() {
+        let batch = [];
+        for (const file of inputFiles) {
+          const path = file.webkitRelativePath || file.name;
+          if (isInIgnoredDir(path)) {
+            skippedCount++;
+            continue;
+          }
+          const syncable = isSyncable(path, null);
+          if (syncable) {
+            const content = await file.text();
+            batch.push({ path, content, is_syncable: true });
+            totalFiles++;
+
+            if (batch.length >= BATCH_SIZE) {
+              yield batch;
+              batch = [];
+            }
+          } else {
+            skippedCount++;
+          }
+        }
+        if (batch.length > 0) {
+          yield batch;
         }
       }
-      const newState = await syncFiles(fileList);
+
+      showToast('Uploading...');
+      const newState = await streamingSyncFiles(
+        streamingFileInput(),
+        ({ filesProcessed }) => {
+          showToast(`Uploading... ${filesProcessed} files`);
+        }
+      );
       await applyState(newState);
-      showToast(`Uploaded ${fileList.length} files`);
+      showToast(`Uploaded ${totalFiles} files (${skippedCount} skipped)`);
       event.target.value = '';
     }
 

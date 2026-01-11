@@ -687,12 +687,15 @@ File deletions are now propagated via delta sync:
 - Server tracks deletions in `deleted_files` table with version numbers
 - Delta sync response includes `deleted_path_hashes[]` array
 - Client removes deleted files from local state automatically
+- **Automatic cleanup**: Old deletion records pruned hourly (keeps last 100 versions per room)
 
 ### OT Conflict Detection (Implemented)
 
-The ops endpoint now includes conflict detection:
+The ops endpoint now includes conflict detection with race condition prevention:
+- **Row-level locking**: Uses `SELECT ... FOR UPDATE` on room and file rows
 - Server checks `base_version` against file's current version
 - Returns HTTP 409 with `conflicting_ops[]` when conflicts detected
+- Handles edge case of stale clients with `base_version=0`
 - Client receives all conflicting operations to enable resolution
 
 ```javascript
@@ -714,6 +717,13 @@ The `/api/workspace/:id/finalize` endpoint now returns both formats:
 - `documents[]` - Disguised format for backward compatibility
 - `deleted_path_hashes[]` - For delta sync support
 
+### Sync Version Optimization (Implemented)
+
+Room version is only incremented when files are actually deleted during sync:
+- Prevents unnecessary version bumps on no-op finalizations
+- Reduces delta sync noise for clients
+- Applied to all sync endpoints: `/sync`, `/sync/complete`, `/finalize`
+
 ### Traffic Obfuscation Suite (Implemented)
 
 To evade traffic analysis and anomaly detection, LivePaste now mimics standard SaaS traffic patterns:
@@ -723,4 +733,28 @@ To evade traffic analysis and anomaly detection, LivePaste now mimics standard S
 3. **Decoy Headers:** Realistic headers (`X-Feature-Flags`, `X-Client-Version`) are injected to resemble complex SaaS applications.
 4. **Fake Sync:** Background heartbeat requests (`/api/workspace/sync`) occur every 25-45s to mimic "keep-alive" traffic of active collaboration tools.
 5. **Field Stripping:** The server automatically strips decoy fields (`_analytics`, `_meta`, `_pad`) before processing requests.
+
+### Streaming Upload (Implemented)
+
+Folder uploads now use streaming to minimize memory usage for large codebases:
+
+**Before (accumulated):**
+```
+Scan all files → fileList[] (plaintext) → encrypted[] → chunks[] → upload
+Peak memory: ~2x total file content size
+```
+
+**After (streaming):**
+```
+Scan batch → encrypt batch → upload → release memory → next batch
+Peak memory: ~(batch_size × avg_file_size) ≈ 200KB-2MB
+```
+
+Key improvements:
+1. **Async generators** - `streamingScan()` yields file batches as they're discovered
+2. **Immediate upload** - Each batch is encrypted and uploaded before loading next
+3. **Early GC** - Plaintext content nulled immediately after encryption
+4. **Configurable batch size** - `SCAN_BATCH_SIZE = 20` files per batch
+
+This reduces memory usage from O(n) to O(1) relative to codebase size, enabling upload of large Java/enterprise monorepos without browser memory issues.
 
