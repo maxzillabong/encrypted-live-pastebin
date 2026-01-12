@@ -369,6 +369,26 @@ CREATE TABLE changes (
 | POST | `/api/room/:id/sync/complete` | Complete sync |
 | POST | `/api/room/:id/sync` | Legacy bulk sync (backward compat) |
 
+**Sync begin request** (streaming mode uses `-1` for unknown counts):
+```json
+{
+  "client_id": "client_abc123",
+  "total_chunks": -1,
+  "total_files": -1
+}
+```
+
+**Sync complete response:**
+```json
+{
+  "files": [...],
+  "sync_complete": true,
+  "files_synced": 150,
+  "files_deleted": 3,
+  "server_timestamp": "2024-01-15T10:30:00.000Z"
+}
+```
+
 ### Operations (Real-Time Deltas)
 
 | Method | Endpoint | Description |

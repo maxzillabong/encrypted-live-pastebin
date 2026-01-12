@@ -746,7 +746,8 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// Begin chunked sync session
+// Begin a chunked sync session
+// Note: total_chunks and total_files may be -1 for streaming mode where counts are unknown upfront
 app.post('/api/room/:id/sync/begin', requireRoomPassword, async (req, res) => {
   const roomId = req.params.id;
   const { client_id, total_chunks, total_files, metadata } = req.body;
@@ -758,8 +759,8 @@ app.post('/api/room/:id/sync/begin', requireRoomPassword, async (req, res) => {
     syncSessions.set(`${roomId}:${sessionId}`, {
       roomId,
       clientId: client_id,
-      totalChunks: total_chunks,
-      totalFiles: total_files,
+      totalChunks: total_chunks,  // -1 indicates streaming mode
+      totalFiles: total_files,    // -1 indicates streaming mode
       receivedChunks: 0,
       pathHashes: new Set(),
       startedAt: Date.now(),
