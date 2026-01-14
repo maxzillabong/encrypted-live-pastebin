@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>LivePaste - E2E Encrypted Code Sharing</title>
+  <title>Live Collab - E2E</title>
   <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
@@ -324,14 +324,14 @@
 </head>
 <body>
   <header>
-    <div class="logo"><span>&#128274;</span><span>LivePaste</span></div>
+    <div class="logo"><span>&#128274;</span><span>Live Collab</span></div>
     <div class="room-url" id="roomUrl" onclick="copyRoomUrl()"></div>
     <button class="btn" onclick="copyRoomUrl()">Share</button>
     <button class="btn btn-secondary" onclick="showQRCode()" title="QR code (for browser isolation)">QR</button>
     <button class="btn btn-secondary" id="passwordBtn" onclick="showSetPasswordModal()" title="Set room password">&#128272;</button>
     <button class="btn btn-danger" onclick="confirmKillRoom()" title="Delete Room" style="background:#e94560;color:white;border:none">&#128163;</button>
     <div class="status">
-      <span id="isolationWarning" style="display:none;background:#e94560;color:white;padding:2px 6px;border-radius:4px;font-size:0.75rem;cursor:help" title="Browser isolation detected - your organization may be able to see decrypted content">ISOLATED</span>
+      <span id="isolationWarning" style="display:none;background:#e94560;color:white;padding:2px 6px;border-radius:4px;font-size:0.75rem;cursor:pointer" onclick="runComprehensiveIsolationCheck()" title="Browser isolation detected - click for detailed analysis">ISOLATED</span>
       <span id="passwordStatus" style="display:none">&#128274;</span>
       <span>&#128274; E2E</span>
       <div class="status-dot" id="statusDot"></div>
@@ -373,8 +373,8 @@
       <div class="file-header" id="fileHeader">No file selected</div>
       <div class="editor-container" id="editorContainer">
         <div class="empty-state" id="emptyState">
-          <h2>&#128274; LivePaste</h2>
-          <p>E2E encrypted real-time code sharing. Upload a folder or create a file to get started.</p>
+          <h2>&#128274; Live Collab</h2>
+          <p>E2E real-time collab. Upload a folder or create a file to get started.</p>
         </div>
         <div id="editorWrapper" class="hidden" style="height:100%"></div>
         <div class="diff-view hidden" id="diffView"></div>
@@ -2253,68 +2253,363 @@ hasMore = normalized.has_more;
       }
     }
 
-    // Detect browser isolation (Zscaler Cloud Browser, Menlo, etc.)
-    async function detectBrowserIsolation() {
-      const signs = [];
+    // Browser Isolation Detection (Passive + Comprehensive)
+    // Passive checks run automatically on load (non-suspicious)
+    // Comprehensive checks run on user request (click isolation badge)
 
-      // Check 1: Clipboard API blocked
+    let isolationIndicators = [];
+    let isolationConfidence = 'unknown';
+    let hasRunComprehensive = false;
+
+    // Passive checks - just read existing data, no active probing
+    function detectBrowserIsolation() {
+      const indicators = [];
+      const weights = {};
+
+      // Check 1: Frame ancestry (standard anti-clickjacking check)
       try {
-        await navigator.clipboard.readText();
+        if (window.self !== window.top) {
+          indicators.push('Running in iframe');
+          weights['iframe'] = 1;
+        }
       } catch (e) {
-        if (e.name === 'NotAllowedError' || e.message.includes('denied')) {
-          signs.push('clipboard_blocked');
+        indicators.push('Cross-origin frame detected');
+        weights['cross_origin'] = 2;
+      }
+
+      // Check 2: User agent analysis for known RBI proxies
+      const ua = navigator.userAgent.toLowerCase();
+      const isolationUAPatterns = [
+        'menlo', 'fireglass', 'symantec', 'zscaler', 'netskope',
+        'proofpoint', 'forcepoint', 'ericom', 'citrix', 'cloudflare',
+        'browserling', 'browserstack', 'authentic8', 'island'
+      ];
+
+      for (const pattern of isolationUAPatterns) {
+        if (ua.includes(pattern)) {
+          indicators.push('Isolation proxy UA: ' + pattern);
+          weights['ua_' + pattern] = 3;
         }
       }
 
-      // Check 2: Known isolation user agents / injected elements
-      const ua = navigator.userAgent.toLowerCase();
-      const isolationHints = ['menlo', 'isolation', 'cloudflare-browser', 'zscaler', 'symantec-ws'];
-      for (const hint of isolationHints) {
-        if (ua.includes(hint)) signs.push('ua_' + hint);
+      // Check 3: Screen capture API availability (just check existence)
+      try {
+        if (!('mediaDevices' in navigator) || !('getDisplayMedia' in navigator.mediaDevices)) {
+          indicators.push('Screen capture API missing');
+          weights['screencapture'] = 1;
+        }
+      } catch (e) {
+        indicators.push('MediaDevices restricted');
+        weights['mediadevices'] = 1;
       }
 
-      // Check 3: Look for injected isolation scripts/elements
-      const scripts = document.querySelectorAll('script[src*="isolation"], script[src*="menlo"], script[src*="zscaler"]');
-      if (scripts.length > 0) signs.push('injected_scripts');
-
-      // Check 4: Check for isolation-specific globals
-      if (window.__isolation__ || window.__menlo__ || window.__zscaler__) {
-        signs.push('isolation_global');
+      // Check 4: Look for injected isolation scripts/elements
+      const scripts = document.querySelectorAll('script[src*="isolation"], script[src*="menlo"], script[src*="zscaler"], script[src*="netskope"]');
+      if (scripts.length > 0) {
+        indicators.push('Injected isolation scripts');
+        weights['injected_scripts'] = 2;
       }
 
-      // Check 5: Input latency test (pixel streaming adds ~50-200ms)
-      const latencyTest = await measureInputLatency();
-      if (latencyTest > 100) signs.push('high_latency_' + Math.round(latencyTest) + 'ms');
+      // Check 5: Check for isolation-specific globals
+      if (window.__isolation__ || window.__menlo__ || window.__zscaler__ || window.__netskope__) {
+        indicators.push('Isolation global variables');
+        weights['isolation_global'] = 3;
+      }
 
-      if (signs.length > 0) {
-        console.warn('Browser isolation detected:', signs);
-        document.getElementById('isolationWarning').style.display = 'inline';
-        document.getElementById('isolationWarning').title =
-          'Browser isolation detected (' + signs.join(', ') + ') - your organization may be able to see decrypted content';
+      // Calculate results - require multiple indicators for passive detection
+      const totalWeight = Object.values(weights).reduce((a, b) => a + b, 0);
+      const isIsolated = totalWeight >= 3;
+
+      if (totalWeight >= 5) {
+        isolationConfidence = 'high';
+      } else if (totalWeight >= 4) {
+        isolationConfidence = 'medium';
+      } else if (totalWeight >= 3) {
+        isolationConfidence = 'low';
+      }
+
+      isolationIndicators = indicators;
+
+      if (isIsolated) {
+        console.warn('Browser isolation detected (passive):', indicators);
+        showIsolationWarning();
       }
     }
 
-    function measureInputLatency() {
+    // Comprehensive checks - active probing (only on user click)
+    async function runComprehensiveIsolationCheck() {
+      if (hasRunComprehensive) {
+        // Already ran, just show details
+        showIsolationDetails();
+        return;
+      }
+
+      showToast('Running isolation analysis...', 'info');
+      const indicators = [...isolationIndicators]; // Start with passive indicators
+      const weights = {};
+
+      // Copy weights from passive detection
+      if (indicators.some(i => i.includes('Cross-origin'))) weights['cross_origin'] = 2;
+      if (indicators.some(i => i.includes('iframe'))) weights['iframe'] = 1;
+      indicators.filter(i => i.includes('Isolation proxy UA')).forEach(i => {
+        weights['ua_' + i.split(': ')[1]] = 3;
+      });
+
+      // Test 1: Animation frame latency (most reliable for pixel streaming)
+      try {
+        const frameLatency = await measureFrameLatency();
+        if (frameLatency > 40) {
+          indicators.push('High frame latency: ' + frameLatency.toFixed(1) + 'ms');
+          weights['frame_latency'] = frameLatency > 100 ? 3 : 2;
+        }
+      } catch (e) { /* ignore */ }
+
+      // Test 2: RequestAnimationFrame jitter analysis
+      try {
+        const { variance, avgDelta } = await measureFrameTimingVariance();
+        if (variance < 0.5 && avgDelta > 20) {
+          indicators.push('Suspiciously consistent frame timing (variance: ' + variance.toFixed(2) + ')');
+          weights['frame_variance'] = 2;
+        } else if (avgDelta > 25) {
+          indicators.push('High average frame delta: ' + avgDelta.toFixed(1) + 'ms');
+          weights['frame_delta'] = 2;
+        }
+      } catch (e) { /* ignore */ }
+
+      // Test 3: WebGL virtual GPU detection
+      try {
+        const gpuInfo = checkForVirtualGPU();
+        if (gpuInfo.isVirtual) {
+          indicators.push('Virtual GPU: ' + gpuInfo.renderer);
+          weights['virtual_gpu'] = 3;
+        }
+      } catch (e) { /* ignore */ }
+
+      // Test 4: Canvas fingerprint complexity
+      try {
+        const canvasComplexity = getCanvasFingerprint();
+        if (canvasComplexity < 1000) {
+          indicators.push('Low canvas complexity (possible compression)');
+          weights['canvas'] = 2;
+        }
+      } catch (e) { /* ignore */ }
+
+      // Test 5: Network RTT check
+      try {
+        const rtt = await measureNetworkRTT();
+        if (rtt > 100) {
+          indicators.push('High network RTT: ' + rtt.toFixed(0) + 'ms');
+          weights['network_rtt'] = rtt > 200 ? 3 : 2;
+        }
+      } catch (e) { /* ignore */ }
+
+      // Test 6: WebRTC restrictions
+      try {
+        const webrtcBlocked = await checkWebRTCRestricted();
+        if (webrtcBlocked) {
+          indicators.push('WebRTC restricted');
+          weights['webrtc'] = 2;
+        }
+      } catch (e) {
+        indicators.push('WebRTC blocked');
+        weights['webrtc'] = 2;
+      }
+
+      // Test 7: Local storage restrictions
+      try {
+        localStorage.setItem('__isolation_test__', '1');
+        localStorage.removeItem('__isolation_test__');
+      } catch (e) {
+        indicators.push('Local storage restricted');
+        weights['localstorage'] = 2;
+      }
+
+      // Test 8: Clipboard API availability (check existence only, NOT read)
+      try {
+        if (!navigator.clipboard || !navigator.clipboard.writeText) {
+          indicators.push('Clipboard API unavailable');
+          weights['clipboard'] = 1;
+        }
+      } catch (e) {
+        indicators.push('Clipboard API restricted');
+        weights['clipboard'] = 1;
+      }
+
+      // Calculate confidence
+      const totalWeight = Object.values(weights).reduce((a, b) => a + b, 0);
+      const isIsolated = totalWeight >= 4;
+
+      if (totalWeight >= 8) {
+        isolationConfidence = 'high';
+      } else if (totalWeight >= 6) {
+        isolationConfidence = 'medium';
+      } else if (totalWeight >= 4) {
+        isolationConfidence = 'low';
+      } else {
+        isolationConfidence = 'unknown';
+      }
+
+      // Determine detection type
+      let detectionType = 'none';
+      if (isIsolated) {
+        if (weights['frame_latency'] >= 2 || weights['frame_variance'] >= 2) {
+          detectionType = 'pixel-streaming';
+        } else if (weights['virtual_gpu'] >= 2) {
+          detectionType = 'virtual-machine';
+        } else {
+          detectionType = 'rbi';
+        }
+      }
+
+      isolationIndicators = indicators;
+      hasRunComprehensive = true;
+
+      if (isIsolated) {
+        console.warn('Browser isolation detected (comprehensive):', indicators, 'Type:', detectionType);
+        showIsolationWarning();
+      }
+
+      showIsolationDetails();
+    }
+
+    function showIsolationWarning() {
+      const badge = document.getElementById('isolationWarning');
+      badge.style.display = 'inline';
+      const confidenceText = isolationConfidence !== 'unknown' ? ' (' + isolationConfidence + ' confidence)' : '';
+      badge.title = 'Browser isolation detected' + confidenceText + ' - click for details';
+    }
+
+    function showIsolationDetails() {
+      const details = isolationIndicators.length > 0
+        ? isolationIndicators.join('\n• ')
+        : 'No isolation indicators detected';
+      const prefix = hasRunComprehensive ? 'Comprehensive analysis:\n• ' : 'Passive detection:\n• ';
+      alert(prefix + details + '\n\nConfidence: ' + isolationConfidence);
+    }
+
+    // Detection helper functions
+    function measureFrameLatency() {
       return new Promise(resolve => {
         const start = performance.now();
-        const input = document.createElement('input');
-        input.style.cssText = 'position:fixed;top:-100px;opacity:0';
-        document.body.appendChild(input);
-        input.focus();
+        requestAnimationFrame(() => {
+          resolve(performance.now() - start);
+        });
+      });
+    }
 
-        const handler = () => {
-          const latency = performance.now() - start;
-          input.remove();
-          resolve(latency);
-        };
+    function measureFrameTimingVariance() {
+      return new Promise(resolve => {
+        const timings = [];
+        let lastTime = performance.now();
+        let frameCount = 0;
 
-        input.addEventListener('focus', handler, { once: true });
+        function checkFrame(time) {
+          const delta = time - lastTime;
+          timings.push(delta);
+          lastTime = time;
+          frameCount++;
 
-        // Fallback timeout
-        setTimeout(() => {
-          input.remove();
-          resolve(0);
-        }, 500);
+          if (frameCount < 30) {
+            requestAnimationFrame(checkFrame);
+          } else {
+            const avg = timings.reduce((a, b) => a + b) / timings.length;
+            const variance = timings.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / timings.length;
+            resolve({ variance, avgDelta: avg });
+          }
+        }
+
+        requestAnimationFrame(checkFrame);
+      });
+    }
+
+    function checkForVirtualGPU() {
+      const canvas = document.createElement('canvas');
+      const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+
+      if (!gl) return { isVirtual: false, renderer: 'unknown' };
+
+      const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+      if (!debugInfo) return { isVirtual: false, renderer: 'unknown' };
+
+      const renderer = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL);
+      const vendor = gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL);
+      const combined = (vendor + ' ' + renderer).toLowerCase();
+
+      const virtualGPUs = [
+        'swiftshader', 'vmware', 'virtualbox', 'parallels',
+        'nvidia grid', 'microsoft basic render driver', 'llvmpipe', 'virgl', 'qemu'
+      ];
+
+      const isVirtual = virtualGPUs.some(gpu => {
+        const pattern = new RegExp('\\b' + gpu.replace(/\s+/g, '\\s+') + '\\b', 'i');
+        return pattern.test(combined);
+      });
+
+      return { isVirtual, renderer: vendor + ' ' + renderer };
+    }
+
+    function getCanvasFingerprint() {
+      const canvas = document.createElement('canvas');
+      canvas.width = 200;
+      canvas.height = 50;
+      const ctx = canvas.getContext('2d');
+
+      if (!ctx) return 10000;
+
+      ctx.fillStyle = 'rgb(255, 0, 0)';
+      ctx.fillRect(0, 0, 100, 50);
+
+      const gradient = ctx.createLinearGradient(0, 0, 200, 50);
+      gradient.addColorStop(0, 'blue');
+      gradient.addColorStop(1, 'green');
+      ctx.fillStyle = gradient;
+      ctx.fillRect(100, 0, 100, 50);
+
+      ctx.font = '18px Arial';
+      ctx.fillStyle = 'white';
+      ctx.fillText('Test123', 10, 30);
+
+      return canvas.toDataURL().length;
+    }
+
+    async function measureNetworkRTT() {
+      const start = performance.now();
+      try {
+        await fetch(window.location.origin + '?t=' + Date.now(), {
+          method: 'HEAD',
+          cache: 'no-store',
+          mode: 'same-origin'
+        });
+      } catch (e) {
+        return 0;
+      }
+      return performance.now() - start;
+    }
+
+    async function checkWebRTCRestricted() {
+      return new Promise(resolve => {
+        try {
+          const pc = new RTCPeerConnection({ iceServers: [] });
+          pc.createDataChannel('');
+
+          pc.createOffer()
+            .then(offer => pc.setLocalDescription(offer))
+            .then(() => {
+              pc.close();
+              resolve(false);
+            })
+            .catch(() => {
+              pc.close();
+              resolve(true);
+            });
+
+          setTimeout(() => {
+            pc.close();
+            resolve(false);
+          }, 500);
+        } catch (e) {
+          resolve(true);
+        }
       });
     }
 
