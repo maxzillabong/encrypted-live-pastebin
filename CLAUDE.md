@@ -778,3 +778,50 @@ Key improvements:
 
 This reduces memory usage from O(n) to O(1) relative to codebase size, enabling upload of large Java/enterprise monorepos without browser memory issues.
 
+### Steganographic HTML Encoding (Implemented)
+
+Encrypted content can now be hidden within innocent-looking HTML markup instead of obvious base64 blobs. This provides an additional layer of obfuscation for enterprise DLP systems that flag high-entropy payloads.
+
+**Toggle:** Click the `STEGO` badge in the header to switch between modes:
+- **STEGO (green):** Encrypted content hidden in HTML attributes
+- **BASE64 (gray):** Standard base64 encoding (backward compatible)
+
+**How it works:**
+
+Instead of sending:
+```json
+{"content_encrypted": "U2FsdGVkX1+vupppZksvRf89kOY..."}
+```
+
+The content is encoded as:
+```html
+<div class="doc-content" data-rev="3" data-sync="1705312200000">
+  <p>Document content synchronized.</p>
+  <div class="embed-section" data-iv="a1b2c3d4e5f6a1b2c3d4e5f6">
+    <span class="embed-meta" data-ref="89ab0123" data-v="2.1"></span>
+    <span class="embed-meta" data-sid="cdef4567" data-v="2.1"></span>
+    <span class="embed-meta" data-utm="89ab0123" data-v="2.1"></span>
+  </div>
+  <footer class="doc-footer">
+    <span class="ts">Last updated</span>
+  </footer>
+</div>
+```
+
+**Format variants (randomly selected):**
+
+| Format | Mimics | Example Attribute |
+|--------|--------|-------------------|
+| analytics | Marketing/tracking | `data-ref`, `data-utm`, `data-cid` |
+| cms | Content management | `data-block-id`, `data-asset-id` |
+| social | Social embeds | `data-post`, `data-user`, `data-thread` |
+| ecommerce | Product widgets | `data-sku`, `data-item`, `data-price` |
+
+**Key features:**
+- 4-byte chunks encoded as hex in data attributes
+- Random format selection per encryption prevents fingerprinting
+- IV stored in `data-iv` attribute
+- Cover text randomly varies ("Document synchronized", "Changes saved", etc.)
+- Auto-detection on decryption (works with both formats)
+- Preference persisted in localStorage
+

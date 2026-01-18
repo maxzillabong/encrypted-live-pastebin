@@ -333,6 +333,7 @@
     <div class="status">
       <span id="isolationWarning" style="display:none;background:#e94560;color:white;padding:2px 6px;border-radius:4px;font-size:0.75rem;cursor:pointer" onclick="runComprehensiveIsolationCheck()" title="Browser isolation detected - click for detailed analysis">ISOLATED</span>
       <span id="passwordStatus" style="display:none">&#128274;</span>
+      <span id="stegoToggle" onclick="toggleStegoMode()" style="background:#22c55e;color:white;padding:2px 6px;border-radius:4px;font-size:0.75rem;cursor:pointer" title="Steganographic HTML encoding enabled - click to toggle">STEGO</span>
       <span>&#128274; E2E</span>
       <div class="status-dot" id="statusDot"></div>
       <span id="statusText">Online</span>
@@ -611,6 +612,211 @@
       return btoa(String.fromCharCode(...bytes)).replace(/[+\/=]/g, c => c === '+' ? '-' : c === '/' ? '_' : '').slice(0, 43);
     }
 
+    // === Steganographic HTML Encoding ===
+    // Hide encrypted content in innocent-looking HTML attributes
+    // Multiple format variants to prevent pattern detection
+
+    const STEGO_CHUNK_SIZE = 4; // bytes per chunk
+    const USE_STEGO_ENCODING = true; // Enable steganographic encoding
+
+    // Format variant definitions - each mimics different SaaS patterns
+    const STEGO_FORMATS = {
+      // Analytics/tracking style
+      analytics: {
+        attrs: ['ref', 'sid', 'utm', 'cid', 'hash', 'src', 'rev', 'tag'],
+        elementClass: 'embed-meta',
+        wrapper: (hex, attr) => `<span class="embed-meta" data-${attr}="${hex}" data-v="2.1"></span>`
+      },
+      // CMS/content management style
+      cms: {
+        attrs: ['block', 'node', 'asset', 'media', 'link', 'slot', 'zone', 'part'],
+        elementClass: 'content-block',
+        wrapper: (hex, attr) => `<div class="content-block" data-${attr}-id="${hex}"></div>`
+      },
+      // Social media widget style
+      social: {
+        attrs: ['post', 'user', 'thread', 'reply', 'share', 'react', 'view', 'card'],
+        elementClass: 'social-embed',
+        wrapper: (hex, attr) => `<span class="social-embed" data-${attr}="${hex}" data-type="inline"></span>`
+      },
+      // E-commerce/product style
+      ecommerce: {
+        attrs: ['sku', 'item', 'price', 'stock', 'variant', 'option', 'cart', 'wish'],
+        elementClass: 'product-ref',
+        wrapper: (hex, attr) => `<span class="product-ref" data-${attr}="${hex}" data-currency="USD"></span>`
+      }
+    };
+
+    // All possible attribute names across all formats (for decoding)
+    const STEGO_ALL_ATTRS = [
+      'ref', 'sid', 'utm', 'cid', 'hash', 'src', 'rev', 'tag',
+      'block-id', 'node-id', 'asset-id', 'media-id', 'link-id', 'slot-id', 'zone-id', 'part-id',
+      'post', 'user', 'thread', 'reply', 'share', 'react', 'view', 'card',
+      'sku', 'item', 'price', 'stock', 'variant', 'option', 'cart', 'wish'
+    ];
+
+    // Cover text variants - randomly selected for natural variation
+    const STEGO_COVER_TEXTS = [
+      'Document content synchronized.',
+      'Content has been updated.',
+      'Changes saved successfully.',
+      'Last revision loaded.',
+      'Syncing workspace data...',
+      'Document ready.',
+      'Content loaded from server.',
+      'Workspace synchronized.'
+    ];
+
+    function uint8ArrayToHex(array) {
+      return Array.from(array).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function hexToUint8Array(hex) {
+      const bytes = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < bytes.length; i++) {
+        bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+      }
+      return bytes;
+    }
+
+    // Randomly select a format for this encryption
+    function selectStegoFormat() {
+      const formats = ['analytics', 'cms', 'social', 'ecommerce'];
+      return formats[Math.floor(Math.random() * formats.length)];
+    }
+
+    // Encode ciphertext bytes as HTML with data attributes
+    function stegoChunkEncode(data, format) {
+      const selectedFormat = format || selectStegoFormat();
+      const config = STEGO_FORMATS[selectedFormat];
+      const chunks = [];
+
+      for (let i = 0; i < data.length; i += STEGO_CHUNK_SIZE) {
+        const chunk = data.slice(i, i + STEGO_CHUNK_SIZE);
+        const hex = uint8ArrayToHex(chunk);
+        const attr = config.attrs[chunks.length % config.attrs.length];
+        chunks.push(config.wrapper(hex, attr));
+      }
+
+      return chunks.join('\n');
+    }
+
+    // Build regex pattern for all supported attribute formats
+    function buildStegoDecodeRegex() {
+      const attrPattern = STEGO_ALL_ATTRS.map(a => a.replace('-', '\\-')).join('|');
+      return new RegExp(`data-(?:${attrPattern})="([a-f0-9]+)"`, 'g');
+    }
+
+    // Decode ciphertext from HTML data attributes (supports all formats)
+    function stegoChunkDecode(html) {
+      const regex = buildStegoDecodeRegex();
+      const chunks = [];
+      let match;
+
+      while ((match = regex.exec(html)) !== null) {
+        chunks.push(hexToUint8Array(match[1]));
+      }
+
+      // Concatenate all chunks
+      const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const result = new Uint8Array(totalLength);
+      let offset = 0;
+
+      for (const chunk of chunks) {
+        result.set(chunk, offset);
+        offset += chunk.length;
+      }
+
+      return result;
+    }
+
+    // Wrap encrypted content in innocent-looking document markup
+    function stegoWrapContent(ivHex, encodedChunks, coverText) {
+      const timestamp = Date.now();
+      const selectedCover = coverText || STEGO_COVER_TEXTS[Math.floor(Math.random() * STEGO_COVER_TEXTS.length)];
+      const revNumber = Math.floor(Math.random() * 10) + 1;
+
+      return `<div class="doc-content" data-rev="${revNumber}" data-sync="${timestamp}">
+  <p>${selectedCover}</p>
+  <div class="embed-section" data-iv="${ivHex}">
+${encodedChunks}
+  </div>
+  <footer class="doc-footer">
+    <span class="ts">Last updated</span>
+  </footer>
+</div>`;
+    }
+
+    // Extract encrypted content from document markup
+    function stegoUnwrapContent(html) {
+      // Extract IV
+      const ivMatch = html.match(/data-iv="([^"]+)"/);
+      if (!ivMatch) return null;
+
+      // Extract and decode chunks
+      const data = stegoChunkDecode(html);
+      if (data.length === 0) return null;
+
+      return {
+        iv: ivMatch[1],
+        data: data
+      };
+    }
+
+    // Check if content appears to be stego-encoded HTML
+    function isStegoEncodedContent(content) {
+      if (!content || typeof content !== 'string') return false;
+      if (!content.includes('data-iv="')) return false;
+
+      // Check for any of the chunk format patterns
+      const hasAnalytics = /data-(?:ref|sid|utm|cid|hash|src|rev|tag)="[a-f0-9]+"/.test(content);
+      const hasCms = /data-(?:block|node|asset|media|link|slot|zone|part)-id="[a-f0-9]+"/.test(content);
+      const hasSocial = /data-(?:post|user|thread|reply|share|react|view|card)="[a-f0-9]+"/.test(content);
+      const hasEcommerce = /data-(?:sku|item|price|stock|variant|option|cart|wish)="[a-f0-9]+"/.test(content);
+
+      return hasAnalytics || hasCms || hasSocial || hasEcommerce;
+    }
+
+    // High-level: Encode base64 ciphertext to stego HTML
+    function stegoEncode(base64Ciphertext) {
+      if (!USE_STEGO_ENCODING) return base64Ciphertext;
+
+      // Convert base64 to bytes
+      const data = Uint8Array.from(atob(base64Ciphertext), c => c.charCodeAt(0));
+
+      // IV is first 12 bytes
+      const iv = data.slice(0, 12);
+      const ciphertext = data.slice(12);
+
+      // Encode chunks
+      const encodedChunks = stegoChunkEncode(ciphertext);
+
+      // Wrap in HTML
+      return stegoWrapContent(uint8ArrayToHex(iv), encodedChunks);
+    }
+
+    // High-level: Decode stego HTML back to base64 ciphertext
+    function stegoDecode(html) {
+      if (!isStegoEncodedContent(html)) return html; // Return as-is if not stego-encoded
+
+      const unwrapped = stegoUnwrapContent(html);
+      if (!unwrapped) return html;
+
+      // Reconstruct: IV (from hex) + ciphertext
+      const iv = hexToUint8Array(unwrapped.iv);
+      const combined = new Uint8Array(iv.length + unwrapped.data.length);
+      combined.set(iv);
+      combined.set(unwrapped.data, iv.length);
+
+      // Convert back to base64
+      let binary = '';
+      const chunkSize = 8192;
+      for (let i = 0; i < combined.length; i += chunkSize) {
+        binary += String.fromCharCode(...combined.subarray(i, i + chunkSize));
+      }
+      return btoa(binary);
+    }
+
     // API endpoint mapping for disguise mode
     const API = {
       roomState: (since = 0, limit = 1000, offset = 0) => {
@@ -645,7 +851,8 @@
       document.getElementById('roomUrl').textContent = window.location.href;
     }
 
-    async function encrypt(plaintext) {
+    // Core encryption - returns base64
+    async function encryptRaw(plaintext) {
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const encoded = new TextEncoder().encode(plaintext);
       const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, encoded);
@@ -661,7 +868,14 @@
       return btoa(binary);
     }
 
-    async function decrypt(base64) {
+    // Encrypt with optional stego encoding
+    async function encrypt(plaintext) {
+      const base64 = await encryptRaw(plaintext);
+      return USE_STEGO_ENCODING ? stegoEncode(base64) : base64;
+    }
+
+    // Core decryption - expects base64
+    async function decryptRaw(base64) {
       if (!base64) return '';
       try {
         const data = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
@@ -669,6 +883,19 @@
         const ciphertext = data.slice(12);
         const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, cryptoKey, ciphertext);
         return new TextDecoder().decode(plaintext);
+      } catch (e) {
+        console.error('Decryption failed:', e);
+        return '[Decryption Error]';
+      }
+    }
+
+    // Decrypt with auto-detection of stego encoding
+    async function decrypt(encoded) {
+      if (!encoded) return '';
+      try {
+        // Auto-detect and decode stego content
+        const base64 = isStegoEncodedContent(encoded) ? stegoDecode(encoded) : encoded;
+        return await decryptRaw(base64);
       } catch (e) {
         console.error('Decryption failed:', e);
         return '[Decryption Error]';
@@ -1775,6 +2002,37 @@ hasMore = normalized.has_more;
       showToast('URL copied to clipboard');
     }
 
+    // Toggle steganographic encoding mode
+    function toggleStegoMode() {
+      USE_STEGO_ENCODING = !USE_STEGO_ENCODING;
+      const toggle = document.getElementById('stegoToggle');
+      if (USE_STEGO_ENCODING) {
+        toggle.style.background = '#22c55e';
+        toggle.textContent = 'STEGO';
+        toggle.title = 'Steganographic HTML encoding enabled - click to toggle';
+        showToast('Stego mode enabled - encrypted content hidden in HTML');
+      } else {
+        toggle.style.background = '#64748b';
+        toggle.textContent = 'BASE64';
+        toggle.title = 'Standard base64 encoding - click to enable steganographic mode';
+        showToast('Stego mode disabled - using standard base64');
+      }
+      // Persist preference
+      localStorage.setItem('livepaste_stego_mode', USE_STEGO_ENCODING ? '1' : '0');
+    }
+
+    // Initialize stego mode from saved preference
+    function initStegoMode() {
+      const saved = localStorage.getItem('livepaste_stego_mode');
+      if (saved === '0') {
+        USE_STEGO_ENCODING = false;
+        const toggle = document.getElementById('stegoToggle');
+        toggle.style.background = '#64748b';
+        toggle.textContent = 'BASE64';
+        toggle.title = 'Standard base64 encoding - click to enable steganographic mode';
+      }
+    }
+
     let qrCodeInstance = null;
     function showQRCode() {
       const url = window.location.href;
@@ -2625,7 +2883,38 @@ hasMore = normalized.has_more;
       }, 25000 + Math.random() * 20000); // Random interval 25s-45s
     }
 
-    async function init(){await initEncryption(),detectBrowserIsolation(),startFakeSync();try{const e=await checkRoomInfo();if(hasPassword=e.has_password,updatePasswordUI(),hasPassword&&!roomPassword)return void showPasswordModal()}catch(e){console.error("Failed to check room info:",e)}try{const e=await fetchRoomState();hasPassword=e.has_password||!1,updatePasswordUI(),await applyState(e),initSidebarResize(),startPolling()}catch(e){"Password required"===e.message?showPasswordModal():(console.error("Init error:",e),showToast("Failed to load room","error"))}}init().catch(console.error);
+    async function init() {
+      await initEncryption();
+      initStegoMode(); // Initialize stego mode from saved preference
+      detectBrowserIsolation();
+      startFakeSync();
+      try {
+        const info = await checkRoomInfo();
+        hasPassword = info.has_password;
+        updatePasswordUI();
+        if (hasPassword && !roomPassword) {
+          return void showPasswordModal();
+        }
+      } catch (e) {
+        console.error("Failed to check room info:", e);
+      }
+      try {
+        const state = await fetchRoomState();
+        hasPassword = state.has_password || false;
+        updatePasswordUI();
+        await applyState(state);
+        initSidebarResize();
+        startPolling();
+      } catch (e) {
+        if (e.message === "Password required") {
+          showPasswordModal();
+        } else {
+          console.error("Init error:", e);
+          showToast("Failed to load room", "error");
+        }
+      }
+    }
+    init().catch(console.error);
   </script>
 </body>
 </html>
