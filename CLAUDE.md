@@ -1,8 +1,8 @@
-# CLAUDE.md - LivePaste Technical Documentation
+# CLAUDE.md - LiveCollab Technical Documentation
 
 ## Project Overview
 
-LivePaste is an end-to-end encrypted, real-time collaborative code sharing tool designed for **enterprise proxy compatibility** (Zscaler, corporate firewalls, DLP systems).
+LiveCollab is a real-time collaborative document sharing tool designed for **enterprise proxy compatibility** (Zscaler, corporate firewalls, DLP systems). Content is protected with client-side encryption - the server only sees opaque data.
 
 **Core concept:** Open browser, upload a folder, share a URL (with encryption key in fragment), others see and edit the same files in real-time.
 
@@ -44,8 +44,8 @@ LivePaste is an end-to-end encrypted, real-time collaborative code sharing tool 
   "files": [
     {
       "path_hash": "a1b2c3d4...",
-      "path_encrypted": "base64...",
-      "content_encrypted": "base64...",
+      "title": "<stego HTML or base64>",
+      "body": "<stego HTML or base64>",
       "is_syncable": true
     }
   ],
@@ -267,13 +267,13 @@ CREATE TABLE rooms (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Files with encrypted content and paths
+-- Documents (content and metadata)
 CREATE TABLE files (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
     path_hash VARCHAR(64) NOT NULL,          -- SHA-256 hash for upsert
-    path_encrypted TEXT NOT NULL,            -- encrypted path
-    content_encrypted TEXT,                  -- encrypted content (NULL for binary)
+    title TEXT NOT NULL,                     -- document title/path
+    body TEXT,                               -- document body (NULL for binary)
     is_syncable BOOLEAN NOT NULL DEFAULT true,
     size_bytes BIGINT,                       -- for non-syncable files
     version BIGINT NOT NULL DEFAULT 1,
@@ -288,13 +288,13 @@ CREATE TABLE operations (
     room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
     file_path_hash VARCHAR(64) NOT NULL,     -- which file
     seq BIGINT NOT NULL,                     -- sequence number for ordering
-    op_encrypted TEXT NOT NULL,              -- encrypted: {pos, del, ins}
+    delta TEXT NOT NULL,                     -- change delta: {pos, del, ins}
     client_id VARCHAR(64),                   -- for filtering own ops
     base_version BIGINT NOT NULL DEFAULT 0,  -- for OT conflict detection
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Deleted files (for delta sync propagation)
+-- Removed documents (for delta sync propagation)
 CREATE TABLE deleted_files (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -303,25 +303,25 @@ CREATE TABLE deleted_files (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Changesets for AI/collaborator proposals
+-- Revisions (proposed changes from collaborators)
 CREATE TABLE changesets (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-    author_encrypted TEXT,
-    message_encrypted TEXT,
+    author TEXT,                             -- author identifier
+    message TEXT,                            -- revision message
     status VARCHAR(16) NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     resolved_at TIMESTAMPTZ
 );
 
--- Individual changes within a changeset
+-- Individual changes within a revision
 CREATE TABLE changes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     changeset_id UUID NOT NULL REFERENCES changesets(id) ON DELETE CASCADE,
-    file_path_encrypted TEXT NOT NULL,
-    old_content_encrypted TEXT,
-    new_content_encrypted TEXT NOT NULL,
-    diff_encrypted TEXT,
+    file_ref TEXT NOT NULL,                  -- file reference/path
+    prev_body TEXT,                          -- previous content (for diff)
+    body TEXT NOT NULL,                      -- proposed new content
+    diff TEXT,                               -- unified diff format
     status VARCHAR(16) NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -678,7 +678,7 @@ curl -X POST http://localhost:8080/api/room/test123/sync/chunk \
   -d '{
     "session_id":"abc123",
     "chunk_index":0,
-    "files":[{"path_hash":"abc","path_encrypted":"dGVzdA==","content_encrypted":"aGVsbG8=","is_syncable":true}],
+    "files":[{"path_hash":"abc","title":"dGVzdA==","body":"aGVsbG8=","is_syncable":true}],
     "client_timestamp":"2024-01-15T10:00:00Z",
     "request_id":"req_123"
   }'
@@ -725,7 +725,7 @@ The ops endpoint now includes conflict detection with race condition prevention:
   "current_version": 5,
   "base_version": 3,
   "conflicting_ops": [
-    { "seq": 4, "op_encrypted": "...", "client_id": "other-client" }
+    { "seq": 4, "delta": "...", "client_id": "other-client" }
   ]
 }
 ```
@@ -790,7 +790,7 @@ Encrypted content can now be hidden within innocent-looking HTML markup instead 
 
 Instead of sending:
 ```json
-{"content_encrypted": "U2FsdGVkX1+vupppZksvRf89kOY..."}
+{"body": "U2FsdGVkX1+vupppZksvRf89kOY..."}
 ```
 
 The content is encoded as:

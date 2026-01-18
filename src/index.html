@@ -991,7 +991,7 @@ ${encodedChunks}
             url = '/api/room/' + roomId + '/ops';
             body = {
               file_path_hash: pathHash,
-              op_encrypted: opEncrypted,
+              delta: opEncrypted,
               client_id: clientId,
               base_version: selectedFile.version || 0,
               metadata: generateMetadata()
@@ -1049,7 +1049,7 @@ ${encodedChunks}
             if (opClientId === clientId) continue; // Skip own ops
 
             try {
-              const opEncrypted = USE_DISGUISED_API ? op.data : op.op_encrypted;
+              const opEncrypted = USE_DISGUISED_API ? op.data : op.delta;
               const opData = JSON.parse(await decrypt(opEncrypted));
               applyRemoteOp(opData);
             } catch (e) {
@@ -1105,7 +1105,7 @@ ${encodedChunks}
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            content_encrypted: contentEncrypted,
+            body: contentEncrypted,
             through_seq: opSeq,
             metadata: generateMetadata()
           })
@@ -1305,8 +1305,8 @@ ${encodedChunks}
             files: data.documents.map(d => ({
               id: d.id,
               path_hash: d.metadata?.refs?.[0],
-              path_encrypted: d.title,
-              content_encrypted: d.content,
+              title: d.title,
+              body: d.content,
               is_syncable: d.is_syncable,
               size_bytes: d.size_bytes,
               version: parseInt(d.metadata?.tracking?.utm_source) || 1
@@ -1369,8 +1369,8 @@ hasMore = normalized.has_more;
       } else {
         body = {
           path_hash: pathHash,
-          path_encrypted: pathEnc,
-          content_encrypted: contentEnc,
+          title: pathEnc,
+          body: contentEnc,
           is_syncable: isSyncableFile,
           size_bytes: isSyncableFile ? null : content.length
         };
@@ -1436,8 +1436,8 @@ hasMore = normalized.has_more;
       const encrypted = await Promise.all(batch.map(async f => {
         const result = {
           path_hash: await hashPath(f.path),
-          path_encrypted: await encrypt(f.path),
-          content_encrypted: f.is_syncable ? await encrypt(f.content) : null,
+          title: await encrypt(f.path),
+          body: f.is_syncable ? await encrypt(f.content) : null,
           is_syncable: f.is_syncable,
           size_bytes: f.is_syncable ? null : f.size
         };
@@ -1458,8 +1458,8 @@ hasMore = normalized.has_more;
           batch_index: chunkIndex,
           documents: files.map(f => ({
             id: f.path_hash,
-            title: f.path_encrypted,
-            content: f.content_encrypted,
+            title: f.title,
+            content: f.body,
             metadata: {
               refs: [f.path_hash],
               tracking: { utm_source: 'sync', utm_campaign: generateRequestId() }
@@ -1671,8 +1671,8 @@ hasMore = normalized.has_more;
       // Decrypt new/updated files
       const newFiles = await Promise.all(state.files.map(async f => ({
         ...f,
-        path: await decrypt(f.path_encrypted),
-        content: f.is_syncable ? await decrypt(f.content_encrypted) : null
+        path: await decrypt(f.title),
+        content: f.is_syncable ? await decrypt(f.body) : null
       })));
 
       // Merge into existing files
@@ -1707,14 +1707,14 @@ hasMore = normalized.has_more;
 
       changesets = await Promise.all((state.changesets || []).map(async cs => ({
         ...cs,
-        author: await decrypt(cs.author_encrypted),
-        message: await decrypt(cs.message_encrypted),
+        author: await decrypt(cs.author),
+        message: await decrypt(cs.message),
         changes: await Promise.all((cs.changes || []).map(async ch => ({
           ...ch,
-          file_path: await decrypt(ch.file_path_encrypted),
-          old_content: ch.old_content_encrypted ? await decrypt(ch.old_content_encrypted) : '',
-          new_content: await decrypt(ch.new_content_encrypted),
-          diff: ch.diff_encrypted ? await decrypt(ch.diff_encrypted) : ''
+          file_path: await decrypt(ch.file_ref),
+          old_content: ch.prev_body ? await decrypt(ch.prev_body) : '',
+          new_content: await decrypt(ch.body),
+          diff: ch.diff ? await decrypt(ch.diff) : ''
         })))
       })));
       renderFileTree();
@@ -2194,8 +2194,8 @@ hasMore = normalized.has_more;
             files: syncResult.documents.map(d => ({
               id: d.id,
               path_hash: d.metadata?.refs?.[0],
-              path_encrypted: d.title,
-              content_encrypted: d.content,
+              title: d.title,
+              body: d.content,
               is_syncable: d.is_syncable,
               size_bytes: d.size_bytes,
               version: parseInt(d.metadata?.tracking?.utm_source) || 1
