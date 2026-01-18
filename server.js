@@ -1,5 +1,5 @@
 /**
- * LivePaste - E2E Encrypted Real-Time Collaborative Code Sharing
+ * LiveCollab - Real-Time Collaborative Document Sharing
  * Express server with short polling (simple & proxy-friendly)
  */
 
@@ -186,7 +186,7 @@ async function getRoomState(roomId, sinceVersion = 0, limit = 1000, offset = 0) 
   const opSeq = roomResult.rows[0]?.op_seq || 0;
 
   const filesResult = await pool.query(
-    'SELECT id, path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes, version, snapshot_seq FROM files WHERE room_id = $1 AND version > $2 ORDER BY path_encrypted LIMIT $3 OFFSET $4',
+    'SELECT id, path_hash, title, body, is_syncable, size_bytes, version, snapshot_seq FROM files WHERE room_id = $1 AND version > $2 ORDER BY title LIMIT $3 OFFSET $4',
     [roomId, sinceVersion, limit, offset]
   );
 
@@ -201,7 +201,7 @@ async function getRoomState(roomId, sinceVersion = 0, limit = 1000, offset = 0) 
   }
 
   const changesetsResult = await pool.query(
-    "SELECT c.id, c.author_encrypted, c.message_encrypted, c.status, c.created_at, json_agg(json_build_object('id', ch.id, 'file_path_encrypted', ch.file_path_encrypted, 'old_content_encrypted', ch.old_content_encrypted, 'new_content_encrypted', ch.new_content_encrypted, 'diff_encrypted', ch.diff_encrypted, 'status', ch.status)) FILTER (WHERE ch.id IS NOT NULL) as changes FROM changesets c LEFT JOIN changes ch ON ch.changeset_id = c.id WHERE c.room_id = $1 AND c.status = 'pending' GROUP BY c.id ORDER BY c.created_at DESC",
+    "SELECT c.id, c.author, c.message, c.status, c.created_at, json_agg(json_build_object('id', ch.id, 'file_ref', ch.file_ref, 'prev_body', ch.prev_body, 'body', ch.body, 'diff', ch.diff, 'status', ch.status)) FILTER (WHERE ch.id IS NOT NULL) as changes FROM changesets c LEFT JOIN changes ch ON ch.changeset_id = c.id WHERE c.room_id = $1 AND c.status = 'pending' GROUP BY c.id ORDER BY c.created_at DESC",
     [roomId]
   );
 
@@ -246,8 +246,8 @@ app.get('/api/workspace/:id', requireRoomPassword, async (req, res) => {
       workspace_id: req.params.id,
       documents: state.files.map(f => ({
         id: f.id,
-        title: f.path_encrypted,
-        content: f.content_encrypted,
+        title: f.title,
+        content: f.body,
         metadata: {
           refs: [f.path_hash],
           tracking: { utm_source: f.version?.toString() || '1' }
@@ -304,19 +304,19 @@ app.post('/api/documents/save', requireRoomPassword, async (req, res) => {
 
   // Extract real data from disguised payload
   const path_hash = metadata?.refs?.[0] || await hashString(title);
-  const path_encrypted = title;
-  const content_encrypted = content;
+  const docTitle = title;
+  const docBody = content;
 
   try {
     await ensureRoom(roomId);
     const result = await pool.query(
-      'INSERT INTO files (room_id, path_hash, path_encrypted, content_encrypted, is_syncable) VALUES ($1, $2, $3, $4, true) ON CONFLICT (room_id, path_hash) DO UPDATE SET path_encrypted = $3, content_encrypted = $4, version = files.version + 1, updated_at = NOW() RETURNING id, path_hash, version',
-      [roomId, path_hash, path_encrypted, content_encrypted]
+      'INSERT INTO files (room_id, path_hash, title, body, is_syncable) VALUES ($1, $2, $3, $4, true) ON CONFLICT (room_id, path_hash) DO UPDATE SET title = $3, body = $4, version = files.version + 1, updated_at = NOW() RETURNING id, path_hash, version',
+      [roomId, path_hash, docTitle, docBody]
     );
 
     res.json({
       id: `doc_${result.rows[0].id.slice(0, 8)}`,
-      title: path_encrypted,
+      title: docTitle,
       revision: result.rows[0].version,
       status: 'saved',
       updated_at: new Date().toISOString()
@@ -345,7 +345,7 @@ app.post('/api/documents/:docId/edits', requireRoomPassword, async (req, res) =>
       const seq = seqResult.rows[0].op_seq;
 
       await client.query(
-        'INSERT INTO operations (room_id, file_path_hash, seq, op_encrypted, client_id, base_version) VALUES ($1, $2, $3, $4, $5, $6)',
+        'INSERT INTO operations (room_id, file_path_hash, seq, delta, client_id, base_version) VALUES ($1, $2, $3, $4, $5, $6)',
         [roomId, file_path_hash, seq, edit_data, author_id, base_revision || 0]
       );
       await client.query('COMMIT');
@@ -375,7 +375,7 @@ app.get('/api/documents/:docId/edits', requireRoomPassword, async (req, res) => 
 
   try {
     const result = await pool.query(
-      'SELECT seq, op_encrypted, client_id, created_at FROM operations WHERE room_id = $1 AND file_path_hash = $2 AND seq > $3 ORDER BY seq ASC LIMIT 1000',
+      'SELECT seq, delta, client_id, created_at FROM operations WHERE room_id = $1 AND file_path_hash = $2 AND seq > $3 ORDER BY seq ASC LIMIT 1000',
       [roomId, filePathHash, since]
     );
     const roomResult = await pool.query('SELECT op_seq FROM rooms WHERE id = $1', [roomId]);
@@ -383,7 +383,7 @@ app.get('/api/documents/:docId/edits', requireRoomPassword, async (req, res) => 
     res.json({
       edits: result.rows.map(r => ({
         edit_id: `edit_${r.seq}`,
-        data: r.op_encrypted,
+        data: r.delta,
         author_id: r.client_id,
         timestamp: r.created_at
       })),
@@ -443,7 +443,7 @@ app.post('/api/documents/batch', requireRoomPassword, async (req, res) => {
         const pathHash = doc.metadata?.refs?.[0] || doc.id;
         session.pathHashes.add(pathHash);
         await client.query(
-          'INSERT INTO files (room_id, path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (room_id, path_hash) DO UPDATE SET path_encrypted = $3, content_encrypted = $4, is_syncable = $5, size_bytes = $6, version = files.version + 1, updated_at = NOW()',
+          'INSERT INTO files (room_id, path_hash, title, body, is_syncable, size_bytes) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (room_id, path_hash) DO UPDATE SET title = $3, body = $4, is_syncable = $5, size_bytes = $6, version = files.version + 1, updated_at = NOW()',
           [roomId, pathHash, doc.title, doc.content, doc.is_syncable !== false, doc.size_bytes || null]
         );
       }
@@ -521,8 +521,8 @@ app.post('/api/workspace/:id/finalize', requireRoomPassword, async (req, res) =>
       // Disguised format (for backward compatibility)
       documents: state.files.map(f => ({
         id: f.id,
-        title: f.path_encrypted,
-        content: f.content_encrypted,
+        title: f.title,
+        content: f.body,
         metadata: {
           refs: [f.path_hash],
           tracking: { utm_source: f.version?.toString() || '1' }
@@ -661,14 +661,14 @@ app.get('/api/room/:id/version', requireRoomPassword, async (req, res) => {
 // Create/update file (password protected)
 app.post('/api/room/:id/files', requireRoomPassword, async (req, res) => {
   const roomId = req.params.id;
-  const { path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes } = req.body;
+  const { path_hash, title, body, is_syncable, size_bytes } = req.body;
 
   try {
     await ensureRoom(roomId);
 
     const result = await pool.query(
-      'INSERT INTO files (room_id, path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (room_id, path_hash) DO UPDATE SET path_encrypted = $3, content_encrypted = $4, is_syncable = $5, size_bytes = $6, version = files.version + 1, updated_at = NOW() RETURNING id, path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes, version',
-      [roomId, path_hash, path_encrypted, content_encrypted, is_syncable !== false, size_bytes || null]
+      'INSERT INTO files (room_id, path_hash, title, body, is_syncable, size_bytes) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (room_id, path_hash) DO UPDATE SET title = $3, body = $4, is_syncable = $5, size_bytes = $6, version = files.version + 1, updated_at = NOW() RETURNING id, path_hash, title, body, is_syncable, size_bytes, version',
+      [roomId, path_hash, title, body, is_syncable !== false, size_bytes || null]
     );
 
     const roomVersion = await pool.query('SELECT version FROM rooms WHERE id = $1', [roomId]);
@@ -798,8 +798,8 @@ app.post('/api/room/:id/sync/chunk', requireRoomPassword, async (req, res) => {
       for (const file of files) {
         session.pathHashes.add(file.path_hash);
         await client.query(
-          'INSERT INTO files (room_id, path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (room_id, path_hash) DO UPDATE SET path_encrypted = $3, content_encrypted = $4, is_syncable = $5, size_bytes = $6, version = files.version + 1, updated_at = NOW()',
-          [roomId, file.path_hash, file.path_encrypted, file.content_encrypted, file.is_syncable !== false, file.size_bytes || null]
+          'INSERT INTO files (room_id, path_hash, title, body, is_syncable, size_bytes) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (room_id, path_hash) DO UPDATE SET title = $3, body = $4, is_syncable = $5, size_bytes = $6, version = files.version + 1, updated_at = NOW()',
+          [roomId, file.path_hash, file.title, file.body, file.is_syncable !== false, file.size_bytes || null]
         );
       }
 
@@ -935,8 +935,8 @@ app.post('/api/room/:id/sync', requireRoomPassword, async (req, res) => {
 
       for (const file of files) {
         await client.query(
-          'INSERT INTO files (room_id, path_hash, path_encrypted, content_encrypted, is_syncable, size_bytes) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (room_id, path_hash) DO UPDATE SET path_encrypted = $3, content_encrypted = $4, is_syncable = $5, size_bytes = $6, version = files.version + 1, updated_at = NOW()',
-          [roomId, file.path_hash, file.path_encrypted, file.content_encrypted, file.is_syncable !== false, file.size_bytes || null]
+          'INSERT INTO files (room_id, path_hash, title, body, is_syncable, size_bytes) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (room_id, path_hash) DO UPDATE SET title = $3, body = $4, is_syncable = $5, size_bytes = $6, version = files.version + 1, updated_at = NOW()',
+          [roomId, file.path_hash, file.title, file.body, file.is_syncable !== false, file.size_bytes || null]
         );
       }
 
@@ -959,7 +959,7 @@ app.post('/api/room/:id/sync', requireRoomPassword, async (req, res) => {
 // Create changeset (password protected)
 app.post('/api/room/:id/changesets', requireRoomPassword, async (req, res) => {
   const roomId = req.params.id;
-  const { author_encrypted, message_encrypted, changes } = req.body;
+  const { author, message, changes } = req.body;
 
   try {
     await ensureRoom(roomId);
@@ -969,16 +969,16 @@ app.post('/api/room/:id/changesets', requireRoomPassword, async (req, res) => {
       await client.query('BEGIN');
 
       const changesetResult = await client.query(
-        'INSERT INTO changesets (room_id, author_encrypted, message_encrypted) VALUES ($1, $2, $3) RETURNING *',
-        [roomId, author_encrypted, message_encrypted]
+        'INSERT INTO changesets (room_id, author, message) VALUES ($1, $2, $3) RETURNING *',
+        [roomId, author, message]
       );
       const changeset = changesetResult.rows[0];
 
       const insertedChanges = [];
       for (const change of changes) {
         const changeResult = await client.query(
-          'INSERT INTO changes (changeset_id, file_path_encrypted, old_content_encrypted, new_content_encrypted, diff_encrypted) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-          [changeset.id, change.file_path_encrypted, change.old_content_encrypted, change.new_content_encrypted, change.diff_encrypted]
+          'INSERT INTO changes (changeset_id, file_ref, prev_body, body, diff) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+          [changeset.id, change.file_ref, change.prev_body, change.body, change.diff]
         );
         insertedChanges.push(changeResult.rows[0]);
       }
@@ -1017,8 +1017,8 @@ app.post('/api/room/:id/changesets/:changesetId/accept', requireRoomPassword, as
 
       for (const change of changesResult.rows) {
         await client.query(
-          'INSERT INTO files (room_id, path_encrypted, content_encrypted) VALUES ($1, $2, $3) ON CONFLICT (room_id, path_encrypted) DO UPDATE SET content_encrypted = $3, version = files.version + 1, updated_at = NOW()',
-          [roomId, change.file_path_encrypted, change.new_content_encrypted]
+          'INSERT INTO files (room_id, title, body) VALUES ($1, $2, $3) ON CONFLICT (room_id, title) DO UPDATE SET body = $3, version = files.version + 1, updated_at = NOW()',
+          [roomId, change.file_ref, change.body]
         );
         await client.query("UPDATE changes SET status = 'accepted' WHERE id = $1", [change.id]);
       }
@@ -1072,8 +1072,8 @@ app.post('/api/room/:id/changes/:changeId/accept', requireRoomPassword, async (r
     }
 
     await pool.query(
-      'INSERT INTO files (room_id, path_encrypted, content_encrypted) VALUES ($1, $2, $3) ON CONFLICT (room_id, path_encrypted) DO UPDATE SET content_encrypted = $3, version = files.version + 1, updated_at = NOW()',
-      [roomId, change.file_path_encrypted, change.new_content_encrypted]
+      'INSERT INTO files (room_id, title, body) VALUES ($1, $2, $3) ON CONFLICT (room_id, title) DO UPDATE SET body = $3, version = files.version + 1, updated_at = NOW()',
+      [roomId, change.file_ref, change.body]
     );
 
     await pool.query("UPDATE changes SET status = 'accepted' WHERE id = $1", [changeId]);
@@ -1134,7 +1134,7 @@ app.post('/api/room/:id/changes/:changeId/reject', requireRoomPassword, async (r
 // Submit an operation (tiny encrypted delta)
 app.post('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
   const roomId = req.params.id;
-  const { file_path_hash, op_encrypted, client_id, base_version, metadata } = req.body;
+  const { file_path_hash, delta, client_id, base_version, metadata } = req.body;
 
   try {
     await ensureRoom(roomId);
@@ -1161,7 +1161,7 @@ app.post('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
       if (base_version !== undefined && (base_version > 0 || currentFileVersion > 0)) {
         // Get operations that happened since the client's base version
         const conflictOpsResult = await client.query(
-          'SELECT seq, op_encrypted, client_id FROM operations WHERE room_id = $1 AND file_path_hash = $2 AND seq > $3 ORDER BY seq ASC',
+          'SELECT seq, delta, client_id FROM operations WHERE room_id = $1 AND file_path_hash = $2 AND seq > $3 ORDER BY seq ASC',
           [roomId, file_path_hash, snapshotSeq]
         );
 
@@ -1178,7 +1178,7 @@ app.post('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
             base_version: base_version,
             conflicting_ops: conflictingOps.map(op => ({
               seq: op.seq,
-              op_encrypted: op.op_encrypted,
+              delta: op.delta,
               client_id: op.client_id
             })),
             server_timestamp: new Date().toISOString()
@@ -1195,8 +1195,8 @@ app.post('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
 
       // Insert operation
       await client.query(
-        'INSERT INTO operations (room_id, file_path_hash, seq, op_encrypted, client_id, base_version) VALUES ($1, $2, $3, $4, $5, $6)',
-        [roomId, file_path_hash, seq, op_encrypted, client_id, base_version || 0]
+        'INSERT INTO operations (room_id, file_path_hash, seq, delta, client_id, base_version) VALUES ($1, $2, $3, $4, $5, $6)',
+        [roomId, file_path_hash, seq, delta, client_id, base_version || 0]
       );
 
       await client.query('COMMIT');
@@ -1226,7 +1226,7 @@ app.get('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
   const filePathHash = req.query.file; // Optional: filter by file
 
   try {
-    let query = 'SELECT seq, file_path_hash, op_encrypted, client_id, base_version, created_at FROM operations WHERE room_id = $1 AND seq > $2';
+    let query = 'SELECT seq, file_path_hash, delta, client_id, base_version, created_at FROM operations WHERE room_id = $1 AND seq > $2';
     const params = [roomId, since];
 
     if (filePathHash) {
@@ -1256,7 +1256,7 @@ app.get('/api/room/:id/ops', requireRoomPassword, async (req, res) => {
 // Snapshot a file (compact operations into content)
 app.post('/api/room/:id/files/:pathHash/snapshot', requireRoomPassword, async (req, res) => {
   const { id: roomId, pathHash } = req.params;
-  const { content_encrypted, through_seq } = req.body;
+  const { body, through_seq } = req.body;
 
   try {
     const client = await pool.connect();
@@ -1266,12 +1266,12 @@ app.post('/api/room/:id/files/:pathHash/snapshot', requireRoomPassword, async (r
       // Update file content and snapshot_seq
       await client.query(
         `UPDATE files SET
-          content_encrypted = $1,
+          body = $1,
           snapshot_seq = $2,
           version = version + 1,
           updated_at = NOW()
         WHERE room_id = $3 AND path_hash = $4`,
-        [content_encrypted, through_seq, roomId, pathHash]
+        [body, through_seq, roomId, pathHash]
       );
 
       // Delete old operations for this file that are now in the snapshot
@@ -1351,7 +1351,7 @@ async function start() {
   console.log(`[Cleanup] Scheduled every hour (retention: ${RETENTION_HOURS}h)`);
 
   app.listen(PORT, () => {
-    console.log('[Server] LivePaste running on http://localhost:' + PORT);
+    console.log('[Server] LiveCollab running on http://localhost:' + PORT);
   });
 }
 

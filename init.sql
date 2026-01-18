@@ -1,7 +1,7 @@
--- LivePaste Database Schema
--- E2E encrypted real-time collaborative code sharing
+-- LiveCollab Database Schema
+-- Real-time collaborative document sharing
 
--- Rooms (tracks existence and version)
+-- Workspaces (tracks existence and version)
 CREATE TABLE rooms (
     id VARCHAR(32) PRIMARY KEY,
     version BIGINT NOT NULL DEFAULT 0,
@@ -11,13 +11,13 @@ CREATE TABLE rooms (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Files (encrypted content and paths)
+-- Documents (content and metadata)
 CREATE TABLE files (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-    path_hash VARCHAR(64) NOT NULL,         -- SHA-256 hash of plaintext path (for upsert)
-    path_encrypted TEXT NOT NULL,           -- encrypted file path
-    content_encrypted TEXT,                 -- encrypted content (NULL for non-syncable)
+    path_hash VARCHAR(64) NOT NULL,         -- SHA-256 hash of path (for upsert)
+    title TEXT NOT NULL,                    -- document title/path
+    body TEXT,                              -- document body (NULL for non-syncable)
     is_syncable BOOLEAN NOT NULL DEFAULT true,
     size_bytes BIGINT,                      -- for non-syncable files, show size
     version BIGINT NOT NULL DEFAULT 1,
@@ -26,43 +26,42 @@ CREATE TABLE files (
     UNIQUE(room_id, path_hash)
 );
 
--- Changesets (proposed changes from AI or collaborators)
+-- Revisions (proposed changes from collaborators)
 CREATE TABLE changesets (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-    author_encrypted TEXT,                  -- encrypted: 'claude', 'user-abc', etc
-    message_encrypted TEXT,                 -- encrypted: "Fixed async/await issues"
+    author TEXT,                            -- author identifier
+    message TEXT,                           -- revision message
     status VARCHAR(16) NOT NULL DEFAULT 'pending',  -- pending, accepted, rejected, partial
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     resolved_at TIMESTAMPTZ
 );
 
--- Individual changes within a changeset
+-- Individual changes within a revision
 CREATE TABLE changes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     changeset_id UUID NOT NULL REFERENCES changesets(id) ON DELETE CASCADE,
-    file_path_encrypted TEXT NOT NULL,      -- encrypted file path
-    old_content_encrypted TEXT,             -- encrypted: original content (for diff)
-    new_content_encrypted TEXT NOT NULL,    -- encrypted: proposed new content
-    diff_encrypted TEXT,                    -- encrypted: unified diff format
+    file_ref TEXT NOT NULL,                 -- file reference/path
+    prev_body TEXT,                         -- previous content (for diff)
+    body TEXT NOT NULL,                     -- proposed new content
+    diff TEXT,                              -- unified diff format
     status VARCHAR(16) NOT NULL DEFAULT 'pending',  -- pending, accepted, rejected
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Operations (real-time collaborative edits - tiny encrypted deltas)
--- This enables Google Docs-style traffic patterns that evade entropy detection
+-- Operations (real-time collaborative edits - small deltas)
 CREATE TABLE operations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
     file_path_hash VARCHAR(64) NOT NULL,    -- which file (matches files.path_hash)
     seq BIGINT NOT NULL,                     -- sequence number for ordering (per room)
-    op_encrypted TEXT NOT NULL,              -- encrypted: {pos, del, ins} - typically <500 bytes
+    delta TEXT NOT NULL,                     -- change delta: {pos, del, ins}
     client_id VARCHAR(64),                   -- which client sent this (for filtering own ops)
     base_version BIGINT NOT NULL DEFAULT 0,  -- file version this op was based on
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Deleted files (track recent deletions for delta sync)
+-- Removed documents (track recent deletions for delta sync)
 CREATE TABLE deleted_files (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     room_id VARCHAR(32) NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -124,7 +123,7 @@ CREATE TRIGGER change_updated
     FOR EACH ROW
     EXECUTE FUNCTION notify_change_update();
 
--- Notify on new operations (tiny deltas for real-time editing)
+-- Notify on new operations (deltas for real-time editing)
 CREATE TRIGGER operation_created
     AFTER INSERT ON operations
     FOR EACH ROW
