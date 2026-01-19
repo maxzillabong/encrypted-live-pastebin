@@ -736,7 +736,7 @@
       const selectedCover = coverText || STEGO_COVER_TEXTS[Math.floor(Math.random() * STEGO_COVER_TEXTS.length)];
       const revNumber = Math.floor(Math.random() * 10) + 1;
 
-      return `<div class="doc-content" data-rev="${revNumber}" data-sync="${timestamp}">
+      return `<div class="doc-content" data-revision="${revNumber}" data-sync="${timestamp}">
   <p>${selectedCover}</p>
   <div class="embed-section" data-iv="${ivHex}">
 ${encodedChunks}
